@@ -50,8 +50,11 @@
     }
 
     // ------------------------------------------------------------------ helpers
-    const stat = (label, value, tone = '') =>
-      `<div class="stat ${tone}"><div class="stat-value">${escHtml(String(value))}</div><div class="stat-label">${escHtml(label)}</div></div>`;
+    // Hoisted function declaration — the role dispatch above runs before this
+    // line, so a const arrow here would be in the temporal dead zone.
+    function stat(label, value, tone = '') {
+      return `<div class="stat ${tone}"><div class="stat-value">${escHtml(String(value))}</div><div class="stat-label">${escHtml(label)}</div></div>`;
+    }
 
     async function count(table, build) {
       let q = supabase.from(table).select('id', { count: 'exact', head: true });
