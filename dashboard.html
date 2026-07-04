@@ -19,6 +19,7 @@
     import { bootPage } from './auth.js';
     import { supabase } from './supabase-client.js';
     import { resolveAgencyId } from './agency-context.js';
+    import { mountScoringPanel } from './scoring.js';
     import {
       escHtml, escAttr, fmtDate, renderLoading, renderEmpty, renderErrorState,
       showError, toast, scoreClass, outcomeBadge,
@@ -43,6 +44,15 @@
         case 'training_bureau':  await trainingDash(); break;
         case 'agency_admin':     await agencyAdminDash(); break;
         case 'supervisor':       await supervisorDash(); break;
+      }
+      // Performance Scoring panel — all agency roles (and super_admin when an
+      // agency context is selected via ?agency_id=). Appended after the role
+      // dashboard so a scoring failure never blanks the whole page.
+      if (agencyId) {
+        const panel = document.createElement('div');
+        content.appendChild(panel);
+        mountScoringPanel(panel, { profile, agencyId, threshold })
+          .catch((e) => showError(e, 'Performance scoring'));
       }
     } catch (e) {
       showError(e, 'Dashboard');
