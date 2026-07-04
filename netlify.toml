@@ -1,0 +1,22 @@
+# ============================================================================
+# ATLAS — netlify.toml
+# Flat static deploy, no build step. All HTML/JS/CSS served no-cache so every
+# deploy is live immediately for every user.
+# ============================================================================
+[build]
+  publish = "."
+
+[[headers]]
+  for = "/*.html"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+[[headers]]
+  for = "/*.js"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+[[headers]]
+  for = "/*.css"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"

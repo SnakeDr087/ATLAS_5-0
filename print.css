@@ -1,0 +1,30 @@
+/* ============================================================================
+   ATLAS — print.css · review report print layout
+   Loaded with media="print" on review-report.html.
+   Internal notes are never rendered on the report page at all — this sheet
+   only handles presentation of the report-facing document.
+   ============================================================================ */
+@page { margin: 0.7in; }
+
+body { background: #fff !important; font-size: 12px; color: #000; }
+#sidebar, #topbar, .no-print, #toast-root, .btn { display: none !important; }
+.app, .main { display: block !important; }
+.content { max-width: none !important; padding: 0 !important; }
+
+.card { border: none !important; box-shadow: none !important; padding: 0 0 14px !important; margin-bottom: 10px !important; page-break-inside: avoid; }
+.report-letterhead {
+  display: flex; align-items: center; gap: 16px;
+  border-bottom: 3px double #000; padding-bottom: 12px; margin-bottom: 16px;
+}
+.report-letterhead img { width: 64px; height: 64px; object-fit: contain; }
+.report-agency-name { font-size: 19px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
+.report-doc-title { font-size: 13px; letter-spacing: 0.15em; text-transform: uppercase; }
+
+table.data th { background: #eee !important; color: #000 !important; }
+table.data th, table.data td { border-bottom: 1px solid #999 !important; padding: 6px 8px !important; }
+
+.pill { border: 1px solid #000 !important; background: none !important; color: #000 !important; }
+.kpi-row { border-bottom: 1px solid #ccc !important; padding: 5px 0 !important; }
+.report-sig-block { margin-top: 34px; display: flex; gap: 60px; }
+.report-sig { flex: 1; border-top: 1px solid #000; padding-top: 5px; font-size: 11px; }
+.report-footer { margin-top: 22px; font-size: 10px; color: #444; border-top: 1px solid #999; padding-top: 6px; }

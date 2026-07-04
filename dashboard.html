@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dashboard · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase } from './supabase-client.js';
+    import { resolveAgencyId } from './agency-context.js';
+    import {
+      escHtml, escAttr, fmtDate, renderLoading, renderEmpty, renderErrorState,
+      showError, toast, scoreClass, outcomeBadge,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+
+    const { profile } = await bootPage('dashboard', 'Dashboard');
+    if (new URLSearchParams(location.search).get('err') === 'denied') {
+      toast('You do not have access to that page.', 'error');
+    }
+    renderLoading(content, 'Loading dashboard…');
+
+    const threshold = profile.agency?.min_performance_threshold ?? 80;
+    const agencyId = resolveAgencyId(profile); // supervisor/agency roles: their agency
+
+    try {
+      switch (profile.role) {
+        case 'super_admin':      await superAdminDash(); break;
+        case 'chief':            await chiefDash(); break;
+        case 'internal_affairs': await iaDash(); break;
+        case 'training_bureau':  await trainingDash(); break;
+        case 'agency_admin':     await agencyAdminDash(); break;
+        case 'supervisor':       await supervisorDash(); break;
+      }
+    } catch (e) {
+      showError(e, 'Dashboard');
+      renderErrorState(content);
+    }
+
+    // ------------------------------------------------------------------ helpers
+    const stat = (label, value, tone = '') =>
+      `<div class="stat ${tone}"><div class="stat-value">${escHtml(String(value))}</div><div class="stat-label">${escHtml(label)}</div></div>`;
+
+    async function count(table, build) {
+      let q = supabase.from(table).select('id', { count: 'exact', head: true });
+      if (build) q = build(q);
+      const { count: c, error } = await q;
+      if (error) throw error;
+      return c ?? 0;
+    }
+
+    // ------------------------------------------------------------------ SUPER ADMIN
+    async function superAdminDash() {
+      const [{ data: agencies, error: aErr }, users, officers, reviews, tickets] = await Promise.all([
+        supabase.from('agencies').select('id, name, state, is_active').order('name'),
+        count('profiles'),
+        count('personnel_roster'),
+        count('bwc_reviews'),
+        count('trouble_tickets', (q) => q.in('status', ['open', 'in_progress'])),
+      ]);
+      if (aErr) throw aErr;
+
+      content.innerHTML = `
+        <div class="stat-grid">
+          ${stat('Agencies', (agencies || []).length)}
+          ${stat('Platform users', users)}
+          ${stat('Officers under review', officers)}
+          ${stat('Total reviews', reviews)}
+          ${stat('Open trouble tickets', tickets, tickets ? 'warning' : 'success')}
+        </div>
+        <div class="card">
+          <div class="flex-between"><h2 class="card-title mb-0">Agencies</h2>
+            <a class="btn btn-primary btn-sm" href="admin.html">Admin Panel</a></div>
+          <div id="agency-panels" style="margin-top:14px;"></div>
+        </div>
+        <div class="card">
+          <h2 class="card-title">Platform setup checklist</h2>
+          <div class="check-grid">
+            <label class="check-item"><input type="checkbox" ${agencies?.length ? 'checked' : ''} disabled> At least one agency created</label>
+            <label class="check-item"><input type="checkbox" ${users > 1 ? 'checked' : ''} disabled> Agency users onboarded</label>
+            <label class="check-item"><input type="checkbox" ${officers ? 'checked' : ''} disabled> Rosters populated</label>
+            <label class="check-item"><input type="checkbox" ${reviews ? 'checked' : ''} disabled> First review submitted</label>
+          </div>
+        </div>`;
+
+      const panels = document.getElementById('agency-panels');
+      if (!agencies?.length) { renderEmpty(panels, 'No agencies yet', 'Create the first agency from the Admin Panel.'); return; }
+      panels.innerHTML = agencies.map((a) => `
+        <div class="card" style="margin-bottom:10px;padding:14px 16px;">
+          <div class="flex-between">
+            <strong>${escHtml(a.name)}</strong>
+            <span>
+              <span class="pill">${escHtml(a.state || '')}</span>
+              ${a.is_active ? '' : '<span class="pill pill-danger">inactive</span>'}
+              <button class="btn btn-secondary btn-sm expand-btn" data-id="${escAttr(a.id)}">Details</button>
+              <a class="btn btn-secondary btn-sm" href="reports.html?agency_id=${escAttr(a.id)}">Reports</a>
+            </span>
+          </div>
+          <div class="agency-detail" data-for="${escAttr(a.id)}" hidden style="margin-top:12px;"></div>
+        </div>`).join('');
+
+      panels.querySelectorAll('.expand-btn').forEach((btn) => btn.addEventListener('click', async () => {
+        const box = panels.querySelector(`.agency-detail[data-for="${btn.dataset.id}"]`);
+        if (!box.hidden) { box.hidden = true; return; }
+        box.hidden = false;
+        renderLoading(box, 'Loading agency stats…');
+        try {
+          const id = btn.dataset.id;
+          const [off, revs, dts, ias] = await Promise.all([
+            count('personnel_roster', (q) => q.eq('agency_id', id)),
+            count('bwc_reviews', (q) => q.eq('agency_id', id)),
+            count('delta_t_cases', (q) => q.eq('agency_id', id).eq('status', 'open')),
+            count('ia_cases', (q) => q.eq('agency_id', id).eq('status', 'open')),
+          ]);
+          box.innerHTML = `<div class="stat-grid" style="margin-bottom:0;">
+            ${stat('Officers', off)}${stat('Reviews', revs)}
+            ${stat('Open Delta T', dts, dts ? 'warning' : '')}${stat('Open IA', ias, ias ? 'danger' : '')}
+          </div>`;
+        } catch (e) { renderErrorState(box); }
+      }));
+    }
+
+    // ------------------------------------------------------------------ CHIEF
+    async function chiefDash() {
+      const [{ data: officers, error: oErr }, openIA, openDT, { data: recent, error: rErr }] = await Promise.all([
+        supabase.from('personnel_roster')
+          .select('id, first_name, last_name, badge_number, performance_score, officer_status')
+          .eq('agency_id', agencyId).eq('officer_status', 'active'),
+        count('ia_cases', (q) => q.eq('agency_id', agencyId).eq('status', 'open')),
+        count('delta_t_cases', (q) => q.eq('agency_id', agencyId).eq('status', 'open')),
+        supabase.from('bwc_reviews')
+          .select('id, atlas_case_number, review_date, kpi_score, follow_up_outcome, personnel_roster:primary_officer_id (first_name, last_name)')
+          .eq('agency_id', agencyId).order('created_at', { ascending: false }).limit(8),
+      ]);
+      if (oErr) throw oErr; if (rErr) throw rErr;
+
+      const scored = (officers || []).filter((o) => o.performance_score !== null);
+      const above = scored.filter((o) => o.performance_score >= threshold).length;
+      const below = scored.length - above;
+      const sorted = [...scored].sort((a, b) => b.performance_score - a.performance_score);
+      const top5 = sorted.slice(0, 5), bottom5 = sorted.slice(-5).reverse();
+
+      // Officers with multiple IA referrals
+      const { data: iaRows } = await supabase.from('ia_cases').select('officer_id').eq('agency_id', agencyId);
+      const iaCounts = {};
+      (iaRows || []).forEach((r) => { iaCounts[r.officer_id] = (iaCounts[r.officer_id] || 0) + 1; });
+      const multiIA = (officers || []).filter((o) => (iaCounts[o.id] || 0) >= 2);
+
+      const officerLine = (o) => `
+        <div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border);">
+          <a href="officer-profile.html?id=${escAttr(o.id)}">${escHtml(o.last_name)}, ${escHtml(o.first_name)} <span class="text-muted">#${escHtml(o.badge_number || '')}</span></a>
+          <span class="${scoreClass(o.performance_score, threshold)}">${o.performance_score ?? '—'}%</span>
+        </div>`;
+
+      content.innerHTML = `
+        <div class="stat-grid">
+          ${stat('Active officers', (officers || []).length)}
+          ${stat(`At/above ${threshold}%`, above, 'success')}
+          ${stat(`Below ${threshold}%`, below, below ? 'danger' : 'success')}
+          ${stat('Open IA cases', openIA, openIA ? 'danger' : 'success')}
+          ${stat('Open Delta T', openDT, openDT ? 'warning' : 'success')}
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;">
+          <div class="card"><h2 class="card-title">Top 5 performers</h2>${top5.map(officerLine).join('') || '<p class="text-muted">No scored officers yet.</p>'}</div>
+          <div class="card"><h2 class="card-title">Bottom 5 performers</h2>${bottom5.map(officerLine).join('') || '<p class="text-muted">No scored officers yet.</p>'}</div>
+        </div>
+        ${multiIA.length ? `<div class="card"><h2 class="card-title">Officers with multiple IA referrals</h2>${multiIA.map((o) => `
+          <div class="flex-between" style="padding:6px 0;">
+            <a href="officer-profile.html?id=${escAttr(o.id)}">${escHtml(o.last_name)}, ${escHtml(o.first_name)}</a>
+            <span class="pill pill-danger">${iaCounts[o.id]} referrals</span>
+          </div>`).join('')}</div>` : ''}
+        <div class="card">
+          <div class="flex-between"><h2 class="card-title mb-0">Recent reviews</h2><a href="reviews.html">All reviews →</a></div>
+          <div style="margin-top:10px;">
+            ${(recent || []).map((r) => `
+              <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--border);">
+                <a href="review-detail.html?id=${escAttr(r.id)}">${escHtml(r.atlas_case_number)} · ${escHtml(r.personnel_roster?.last_name || '')}, ${escHtml(r.personnel_roster?.first_name || '')}</a>
+                <span>${outcomeBadge(r.follow_up_outcome)} <span class="${scoreClass(r.kpi_score, threshold)}">${r.kpi_score ?? '—'}%</span></span>
+              </div>`).join('') || '<p class="text-muted">No reviews yet.</p>'}
+          </div>
+        </div>`;
+    }
+
+    // ------------------------------------------------------------------ IA
+    async function iaDash() {
+      const [{ data: cases, error: cErr }, { data: pipRows }, { data: referrals }] = await Promise.all([
+        supabase.from('ia_cases')
+          .select('id, case_number, status, created_at, personnel_roster:officer_id (first_name, last_name)')
+          .eq('agency_id', agencyId).neq('status', 'closed').order('created_at', { ascending: false }),
+        supabase.from('pips').select('id, status').eq('agency_id', agencyId),
+        supabase.from('bwc_reviews').select('id, atlas_case_number, review_date, personnel_roster:primary_officer_id (first_name, last_name)')
+          .eq('agency_id', agencyId).eq('is_ia_referral', true)
+          .order('created_at', { ascending: false }).limit(6),
+      ]);
+      if (cErr) throw cErr;
+      const activePips = (pipRows || []).filter((p) => p.status === 'active').length;
+
+      content.innerHTML = `
+        <div class="stat-grid">
+          ${stat('Open IA cases', (cases || []).length, (cases || []).length ? 'danger' : 'success')}
+          ${stat('Active PIPs', activePips, activePips ? 'warning' : 'success')}
+          ${stat('Total PIPs', (pipRows || []).length)}
+        </div>
+        <div class="card">
+          <div class="flex-between"><h2 class="card-title mb-0">Open IA case queue</h2><a href="ia-cases.html">All cases →</a></div>
+          <div style="margin-top:10px;">
+            ${(cases || []).map((c) => `
+              <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--border);">
+                <a href="ia-case-detail.html?id=${escAttr(c.id)}">${escHtml(c.case_number)} · ${escHtml(c.personnel_roster?.last_name || '')}, ${escHtml(c.personnel_roster?.first_name || '')}</a>
+                <span class="pill pill-danger">${escHtml(c.status)}</span>
+              </div>`).join('') || '<p class="text-muted">No open cases.</p>'}
+          </div>
+        </div>
+        <div class="card">
+          <h2 class="card-title">Recent IA referrals from reviews</h2>
+          ${(referrals || []).map((r) => `
+            <div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border);">
+              <a href="review-detail.html?id=${escAttr(r.id)}">${escHtml(r.atlas_case_number)} · ${escHtml(r.personnel_roster?.last_name || '')}, ${escHtml(r.personnel_roster?.first_name || '')}</a>
+              <span class="text-muted">${fmtDate(r.review_date)}</span>
+            </div>`).join('') || '<p class="text-muted">No referrals yet.</p>'}
+        </div>`;
+    }
+
+    // ------------------------------------------------------------------ TRAINING BUREAU
+    async function trainingDash() {
+      const [{ data: dts, error: dErr }, { data: assigns }, { data: pipRows }] = await Promise.all([
+        supabase.from('delta_t_cases')
+          .select('id, status, t1_incident_date, t2_training_delivered, created_at, personnel_roster:officer_id (first_name, last_name), kpi_definitions:kpi_id (kpi_text)')
+          .eq('agency_id', agencyId).eq('status', 'open').order('t1_incident_date'),
+        supabase.from('training_assignments').select('id, course, assigned_date, date_delivered, personnel_roster:officer_id (first_name, last_name)')
+          .eq('agency_id', agencyId).is('date_delivered', null).order('assigned_date'),
+        supabase.from('pips').select('id, status').eq('agency_id', agencyId),
+      ]);
+      if (dErr) throw dErr;
+
+      const now = Date.now();
+      const flagged = (dts || []).filter((c) => (now - new Date(c.t1_incident_date + 'T00:00:00')) / 86400000 >= 90);
+      const activePips = (pipRows || []).filter((p) => p.status === 'active').length;
+
+      content.innerHTML = `
+        <div class="stat-grid">
+          ${stat('Open Delta T cases', (dts || []).length, (dts || []).length ? 'warning' : 'success')}
+          ${stat('Flagged 90+ days', flagged.length, flagged.length ? 'danger' : 'success')}
+          ${stat('Training due', (assigns || []).length, (assigns || []).length ? 'warning' : 'success')}
+          ${stat('Active PIPs', activePips)}
+        </div>
+        ${flagged.length ? `<div class="card" style="border-left:4px solid var(--danger);">
+          <h2 class="card-title">⚑ Flagged — open 90+ days</h2>
+          ${flagged.map((c) => `
+            <div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border);">
+              <a href="delta-t-detail.html?id=${escAttr(c.id)}">${escHtml(c.personnel_roster?.last_name || '')}, ${escHtml(c.personnel_roster?.first_name || '')} — ${escHtml(c.kpi_definitions?.kpi_text || '')}</a>
+              <span class="pill pill-danger">since ${fmtDate(c.t1_incident_date)}</span>
+            </div>`).join('')}
+        </div>` : ''}
+        <div class="card">
+          <div class="flex-between"><h2 class="card-title mb-0">Open Delta T queue</h2><a href="delta-t.html">All cases →</a></div>
+          <div style="margin-top:10px;">
+            ${(dts || []).slice(0, 10).map((c) => `
+              <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--border);">
+                <a href="delta-t-detail.html?id=${escAttr(c.id)}">${escHtml(c.personnel_roster?.last_name || '')}, ${escHtml(c.personnel_roster?.first_name || '')} — ${escHtml(c.kpi_definitions?.kpi_text || '')}</a>
+                <span class="pill ${c.t2_training_delivered ? 'pill-accent' : 'pill-warning'}">${c.t2_training_delivered ? 'awaiting verification' : 'awaiting training'}</span>
+              </div>`).join('') || '<p class="text-muted">No open cases.</p>'}
+          </div>
+        </div>
+        <div class="card">
+          <h2 class="card-title">Training assignments due</h2>
+          ${(assigns || []).map((a) => `
+            <div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border);">
+              <span>${escHtml(a.course)} — ${escHtml(a.personnel_roster?.last_name || '')}, ${escHtml(a.personnel_roster?.first_name || '')}</span>
+              <span class="text-muted">assigned ${fmtDate(a.assigned_date)}</span>
+            </div>`).join('') || '<p class="text-muted">Nothing outstanding.</p>'}
+        </div>`;
+    }
+
+    // ------------------------------------------------------------------ AGENCY ADMIN
+    async function agencyAdminDash() {
+      const [officers, activeOfficers, pending, users] = await Promise.all([
+        count('personnel_roster', (q) => q.eq('agency_id', agencyId)),
+        count('personnel_roster', (q) => q.eq('agency_id', agencyId).eq('officer_status', 'active')),
+        count('access_requests', (q) => q.eq('agency_id', agencyId).eq('status', 'pending')),
+        count('profiles', (q) => q.eq('agency_id', agencyId)),
+      ]);
+      content.innerHTML = `
+        <div class="stat-grid">
+          ${stat('Roster officers', officers)}
+          ${stat('Active officers', activeOfficers, 'success')}
+          ${stat('App users', users)}
+          ${stat('Pending access requests', pending, pending ? 'warning' : 'success')}
+        </div>
+        <div class="card">
+          <h2 class="card-title">Agency setup checklist</h2>
+          <div class="check-grid">
+            <label class="check-item"><input type="checkbox" ${officers ? 'checked' : ''} disabled> Roster uploaded</label>
+            <label class="check-item"><input type="checkbox" ${users > 1 ? 'checked' : ''} disabled> Users invited</label>
+            <label class="check-item"><input type="checkbox" checked disabled> Baseline content active</label>
+            <label class="check-item"><input type="checkbox" ${pending === 0 ? 'checked' : ''} disabled> Access requests cleared</label>
+          </div>
+        </div>
+        <div class="card">
+          <h2 class="card-title">Shortcuts</h2>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;">
+            <a class="btn btn-primary" href="roster.html">Manage roster</a>
+            <a class="btn btn-secondary" href="admin.html">Users &amp; access requests</a>
+            <a class="btn btn-secondary" href="content-manager.html">Content Manager</a>
+            <a class="btn btn-secondary" href="agency-settings.html">Agency settings</a>
+            <a class="btn btn-secondary" href="tickets.html">Trouble tickets</a>
+          </div>
+        </div>`;
+    }
+
+    // ------------------------------------------------------------------ SUPERVISOR
+    async function supervisorDash() {
+      const [{ data: roster, error: rErr }, { data: myReviews }, { data: myDts }] = await Promise.all([
+        supabase.from('supervisor_rosters')
+          .select('officer_id, personnel_roster:officer_id (id, first_name, last_name, badge_number, performance_score, officer_status)')
+          .eq('supervisor_id', profile.id),
+        supabase.from('bwc_reviews')
+          .select('id, atlas_case_number, review_date, kpi_score, follow_up_outcome, primary_officer_id, personnel_roster:primary_officer_id (first_name, last_name)')
+          .eq('reviewer_id', profile.id).order('created_at', { ascending: false }).limit(8),
+        supabase.from('delta_t_cases')
+          .select('id, status, t1_incident_date, personnel_roster:officer_id (first_name, last_name), kpi_definitions:kpi_id (kpi_text)')
+          .eq('agency_id', agencyId).eq('status', 'open'),
+      ]);
+      if (rErr) throw rErr;
+
+      const officers = (roster || []).map((r) => r.personnel_roster).filter(Boolean);
+      const active = officers.filter((o) => o.officer_status === 'active');
+
+      // Review-due indicator: active officers with no review by me in the last 30 days.
+      const cutoff = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+      const { data: recent30 } = await supabase.from('bwc_reviews')
+        .select('primary_officer_id').eq('reviewer_id', profile.id).gte('review_date', cutoff);
+      const reviewedIds = new Set((recent30 || []).map((r) => r.primary_officer_id));
+      const due = active.filter((o) => !reviewedIds.has(o.id));
+
+      content.innerHTML = `
+        <div class="stat-grid">
+          ${stat('My roster', officers.length)}
+          ${stat('Active officers', active.length, 'success')}
+          ${stat('Reviews due (30-day)', due.length, due.length ? 'warning' : 'success')}
+          ${stat('Open Delta T (my officers)', (myDts || []).length, (myDts || []).length ? 'warning' : 'success')}
+        </div>
+        <div class="card" style="border-left:4px solid var(--accent);">
+          <div class="flex-between">
+            <div>
+              <h2 class="card-title mb-0">Auto Select</h2>
+              <p class="card-sub" style="margin:4px 0 0;">Defensible randomized selection with a permanent audit receipt.</p>
+            </div>
+            <a class="btn btn-primary" href="auto-select.html">Run Auto Select</a>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px;">
+          <div class="card">
+            <div class="flex-between"><h2 class="card-title mb-0">My roster snapshot</h2><a href="roster.html">Manage →</a></div>
+            <div style="margin-top:10px;">
+              ${active.slice(0, 10).map((o) => `
+                <div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border);">
+                  <a href="officer-profile.html?id=${escAttr(o.id)}">${escHtml(o.last_name)}, ${escHtml(o.first_name)} <span class="text-muted">#${escHtml(o.badge_number || '')}</span></a>
+                  <span>
+                    ${due.some((d) => d.id === o.id) ? '<span class="pill pill-warning">review due</span>' : ''}
+                    <span class="${scoreClass(o.performance_score, threshold)}">${o.performance_score ?? '—'}%</span>
+                  </span>
+                </div>`).join('') || '<p class="text-muted">Your roster is empty. Build it on the Roster page.</p>'}
+            </div>
+          </div>
+          <div class="card">
+            <div class="flex-between"><h2 class="card-title mb-0">My recent reviews</h2><a href="reviews.html">All →</a></div>
+            <div style="margin-top:10px;">
+              ${(myReviews || []).map((r) => `
+                <div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border);">
+                  <a href="review-detail.html?id=${escAttr(r.id)}">${escHtml(r.atlas_case_number)} · ${escHtml(r.personnel_roster?.last_name || '')}</a>
+                  <span>${outcomeBadge(r.follow_up_outcome)} <span class="${scoreClass(r.kpi_score, threshold)}">${r.kpi_score ?? '—'}%</span></span>
+                </div>`).join('') || '<p class="text-muted">No reviews yet — run Auto Select to begin.</p>'}
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="flex-between"><h2 class="card-title mb-0">Open Delta T — my officers</h2><a href="delta-t.html">All →</a></div>
+          <div style="margin-top:10px;">
+            ${(myDts || []).slice(0, 8).map((c) => `
+              <div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border);">
+                <a href="delta-t-detail.html?id=${escAttr(c.id)}">${escHtml(c.personnel_roster?.last_name || '')}, ${escHtml(c.personnel_roster?.first_name || '')} — ${escHtml(c.kpi_definitions?.kpi_text || '')}</a>
+                <span class="text-muted">opened ${fmtDate(c.t1_incident_date)}</span>
+              </div>`).join('') || '<p class="text-muted">No open intervention cases.</p>'}
+          </div>
+        </div>`;
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Review Report · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="print.css" media="print" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    // Professional printable report. INTERNAL NOTES ARE NEVER RENDERED HERE —
+    // not hidden by CSS, simply never placed in the DOM of this page.
+    import { bootPage } from './auth.js';
+    import { supabase } from './supabase-client.js';
+    import {
+      escHtml, escAttr, fmtDate, renderLoading, renderErrorState, renderEmpty,
+      showError, scoreClass, outcomeLabel,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('review-detail', 'Review Report');
+    renderLoading(content, 'Preparing report…');
+
+    const id = new URLSearchParams(location.search).get('id');
+    if (!id) { renderEmpty(content, 'No review specified'); throw new Error('no id'); }
+
+    try {
+      const { data: r, error } = await supabase.from('bwc_reviews')
+        .select(`id, atlas_case_number, police_case_number, review_date, incident_date,
+                 recording_start, recording_end, loc_street, loc_apt, loc_floor, loc_city, loc_state,
+                 kpi_responses, safety_checklist, dispositions, kpi_score, follow_up_outcome,
+                 report_notes, primary_officer_id, backup_officer_ids,
+                 personnel_roster:primary_officer_id (first_name, last_name, badge_number, agency_ranks:rank_id (rank_name)),
+                 reviewer:reviewer_id (full_name), incident_types:incident_type_id (name),
+                 agencies:agency_id (name, state, city, patch_url, min_performance_threshold)`)
+        .eq('id', id).maybeSingle();
+      if (error) throw error;
+      if (!r) { renderEmpty(content, 'Review not found'); throw new Error('not found'); }
+
+      const threshold = r.agencies?.min_performance_threshold ?? 80;
+      const kpiIds = Object.keys(r.kpi_responses || {}).filter((k) => k !== 'universal_assessment');
+      const universalId = r.kpi_responses?.universal_assessment || null;
+      const allKpiIds = universalId ? [...kpiIds, universalId] : kpiIds;
+      const safetyIds = Object.keys(r.safety_checklist || {});
+
+      const [{ data: kpis }, { data: safety }, { data: disp }, { data: backups }] = await Promise.all([
+        allKpiIds.length ? supabase.from('kpi_definitions').select('id, kpi_text, sort_order').in('id', allKpiIds) : { data: [] },
+        safetyIds.length ? supabase.from('safety_checklist_items').select('id, item_text').in('id', safetyIds) : { data: [] },
+        supabase.from('disposition_types').select('code, label'),
+        (r.backup_officer_ids || []).length
+          ? supabase.from('personnel_roster').select('first_name, last_name, badge_number').in('id', r.backup_officer_ids)
+          : { data: [] },
+      ]);
+      const kpiText = Object.fromEntries((kpis || []).map((k) => [k.id, k.kpi_text]));
+      const kpiOrder = Object.fromEntries((kpis || []).map((k) => [k.id, k.sort_order]));
+      const dispLabel = Object.fromEntries((disp || []).map((d) => [d.code, d.label]));
+      const loc = [r.loc_street, r.loc_apt && `Apt ${r.loc_apt}`, r.loc_floor && `Fl ${r.loc_floor}`, r.loc_city, r.loc_state]
+        .filter(Boolean).map(escHtml).join(', ') || '—';
+
+      const stateWord = { observed: 'OBSERVED', not_observed: 'NOT OBSERVED', na: 'N/A' };
+
+      content.innerHTML = `
+        <div class="no-print flex-between" style="margin-bottom:16px;">
+          <a href="review-detail.html?id=${escAttr(r.id)}">← Back to review</a>
+          <button class="btn btn-primary" onclick="window.print()">Print report</button>
+        </div>
+
+        <div class="report-letterhead">
+          ${r.agencies?.patch_url ? `<img src="${escAttr(r.agencies.patch_url)}" alt="Agency patch" />` : ''}
+          <div>
+            <div class="report-agency-name">${escHtml(r.agencies?.name || '')}</div>
+            <div class="report-doc-title">Body-Worn Camera Performance Review Report</div>
+            <div class="text-muted" style="font-size:12px;">${escHtml([r.agencies?.city, r.agencies?.state].filter(Boolean).join(', '))}</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Case information</h2>
+          <div class="detail-grid">
+            <div class="detail-item"><div class="dl">ATLAS case #</div><div class="dv">${escHtml(r.atlas_case_number)}</div></div>
+            <div class="detail-item"><div class="dl">Police case #</div><div class="dv">${escHtml(r.police_case_number || '—')}</div></div>
+            <div class="detail-item"><div class="dl">Review date</div><div class="dv">${fmtDate(r.review_date)}</div></div>
+            <div class="detail-item"><div class="dl">Incident date</div><div class="dv">${fmtDate(r.incident_date)}</div></div>
+            <div class="detail-item"><div class="dl">Recording</div><div class="dv">${escHtml(r.recording_start || '—')} → ${escHtml(r.recording_end || '—')}</div></div>
+            <div class="detail-item"><div class="dl">Incident location</div><div class="dv">${loc}</div></div>
+            <div class="detail-item"><div class="dl">Incident type</div><div class="dv">${escHtml(r.incident_types?.name || '—')}</div></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Personnel</h2>
+          <div class="detail-grid">
+            <div class="detail-item"><div class="dl">Primary officer</div><div class="dv">${escHtml(r.personnel_roster?.last_name || '')}, ${escHtml(r.personnel_roster?.first_name || '')} · Badge #${escHtml(r.personnel_roster?.badge_number || '—')} · ${escHtml(r.personnel_roster?.agency_ranks?.rank_name || 'Unranked')}</div></div>
+            <div class="detail-item"><div class="dl">Reviewing supervisor</div><div class="dv">${escHtml(r.reviewer?.full_name || '—')}</div></div>
+            <div class="detail-item"><div class="dl">Backup officers (documentation only)</div><div class="dv">${(backups || []).map((b) => `${escHtml(b.last_name)}, ${escHtml(b.first_name)} #${escHtml(b.badge_number || '')}`).join(' · ') || 'None'}</div></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">KPI assessment — score: <span class="${scoreClass(r.kpi_score, threshold)}">${r.kpi_score ?? '—'}${r.kpi_score !== null ? '%' : ''}</span></h2>
+          ${kpiIds.sort((a, b) => (kpiOrder[a] || 0) - (kpiOrder[b] || 0)).map((k) => `
+            <div class="kpi-row"><span class="kpi-text">${escHtml(kpiText[k] || '(KPI text unavailable)')}</span><strong>${stateWord[r.kpi_responses[k]] || ''}</strong></div>`).join('')}
+          <h3 style="margin:16px 0 4px;">Universal Performance Assessment</h3>
+          <p>${universalId ? escHtml(kpiText[universalId] || '—') : '—'}</p>
+          ${safetyIds.length ? `
+            <h3 style="margin:16px 0 4px;">Officer safety deficiencies noted</h3>
+            ${(safety || []).map((s) => `<div class="kpi-row"><span class="kpi-text">${escHtml(s.item_text)}</span><strong>FLAGGED</strong></div>`).join('')}` : ''}
+          <h3 style="margin:16px 0 4px;">Dispositions</h3>
+          <p>${(r.dispositions || []).map((c) => escHtml(dispLabel[c] || c)).join(' · ') || 'None recorded'}</p>
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Outcome &amp; supervisor narrative</h2>
+          <p><strong>Follow-up outcome:</strong> ${escHtml(outcomeLabel(r.follow_up_outcome))}</p>
+          <p style="white-space:pre-wrap;">${escHtml(r.report_notes || '')}</p>
+          <div class="report-sig-block">
+            <div class="report-sig">Reviewing Supervisor — ${escHtml(r.reviewer?.full_name || '')} / Date</div>
+            <div class="report-sig">Officer Acknowledgment — ${escHtml(r.personnel_roster?.last_name || '')}, ${escHtml(r.personnel_roster?.first_name || '')} / Date</div>
+          </div>
+          <div class="report-footer">Generated by ATLAS Performance Management · ${escHtml(r.atlas_case_number)} · This report contains report-facing content only.</div>
+        </div>`;
+    } catch (e) {
+      if (!['no id', 'not found'].includes(e.message)) { showError(e, 'Report'); renderErrorState(content); }
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PIPs · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase, logActivity } from './supabase-client.js';
+    import { requireAgencyContext } from './agency-context.js';
+    import { OfficerSearch } from './officer-search.js';
+    import {
+      escHtml, escAttr, fmtDate, renderLoading, renderEmpty, renderErrorState,
+      showError, toast,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('pips', 'Performance Improvement Plans');
+    renderLoading(content, 'Loading PIPs…');
+
+    const { agencyId } = await requireAgencyContext(profile, content);
+    if (agencyId) await init();
+
+    async function init() {
+      const canCreate = ['internal_affairs', 'training_bureau'].includes(profile.role);
+      let rows = [];
+      try {
+        const { data, error } = await supabase.from('pips')
+          .select(`id, status, start_date, end_date, created_at,
+                   personnel_roster:officer_id (first_name, last_name, badge_number)`)
+          .eq('agency_id', agencyId).order('created_at', { ascending: false });
+        if (error) throw error;
+        rows = data || [];
+      } catch (e) {
+        showError(e, 'PIPs');
+        renderErrorState(content);
+        return;
+      }
+
+      const active = rows.filter((r) => r.status === 'active');
+
+      content.innerHTML = `
+        <div class="stat-grid">
+          <div class="stat warning"><div class="stat-value">${active.length}</div><div class="stat-label">Active PIPs</div></div>
+          <div class="stat"><div class="stat-value">${rows.filter((r) => r.status === 'draft').length}</div><div class="stat-label">Drafts</div></div>
+          <div class="stat success"><div class="stat-value">${rows.filter((r) => r.status === 'completed').length}</div><div class="stat-label">Completed</div></div>
+          <div class="stat"><div class="stat-value">${rows.length}</div><div class="stat-label">All PIPs</div></div>
+        </div>
+        <div class="card">
+          <div class="filter-bar">
+            <div style="flex:1;min-width:200px;"><label class="field-label">Officer</label><input type="text" id="f-q" /></div>
+            <div><label class="field-label">Status</label>
+              <select id="f-status"><option value="">All</option>
+                ${['draft','active','completed','terminated'].map((s) => `<option value="${s}">${escHtml(s)}</option>`).join('')}</select></div>
+            ${canCreate ? '<div><button class="btn btn-primary" id="new-btn">+ New PIP</button></div>' : ''}
+          </div>
+          <div class="table-wrap"><div id="table"></div></div>
+        </div>
+        <div id="modal-root"></div>`;
+
+      const table = document.getElementById('table');
+      ['f-q', 'f-status'].forEach((id) => document.getElementById(id).addEventListener('input', paint));
+      document.getElementById('new-btn')?.addEventListener('click', openModal);
+      paint();
+
+      function paint() {
+        const q = document.getElementById('f-q').value.trim().toLowerCase();
+        const st = document.getElementById('f-status').value;
+        const list = rows.filter((r) => {
+          if (q) {
+            const hay = `${r.personnel_roster?.first_name} ${r.personnel_roster?.last_name} ${r.personnel_roster?.badge_number}`.toLowerCase();
+            if (!hay.includes(q)) return false;
+          }
+          if (st && r.status !== st) return false;
+          return true;
+        });
+        if (!list.length) { renderEmpty(table, 'No PIPs match', canCreate ? 'Create one with + New PIP.' : 'PIPs your officers are placed on will appear here.'); return; }
+        const pill = (s) => s === 'active' ? 'pill-warning' : s === 'completed' ? 'pill-success' : s === 'terminated' ? 'pill-danger' : 'pill';
+        table.innerHTML = `
+          <table class="data">
+            <thead><tr><th>Officer</th><th>Status</th><th>Start</th><th>End</th><th>Created</th></tr></thead>
+            <tbody>${list.map((r) => `
+              <tr class="rowlink" data-id="${escAttr(r.id)}">
+                <td>${escHtml(r.personnel_roster?.last_name || '')}, ${escHtml(r.personnel_roster?.first_name || '')} <span class="text-muted">#${escHtml(r.personnel_roster?.badge_number || '')}</span></td>
+                <td><span class="pill ${pill(r.status)}">${escHtml(r.status)}</span></td>
+                <td>${fmtDate(r.start_date)}</td><td>${fmtDate(r.end_date)}</td><td>${fmtDate(r.created_at)}</td>
+              </tr>`).join('')}</tbody>
+          </table>`;
+        table.querySelectorAll('.rowlink').forEach((tr) =>
+          tr.addEventListener('click', () => (location.href = `pip-detail.html?id=${tr.dataset.id}`)));
+      }
+
+      function openModal() {
+        const root = document.getElementById('modal-root');
+        root.innerHTML = `
+          <div class="modal-backdrop">
+            <div class="modal">
+              <h2 class="card-title">New Performance Improvement Plan</h2>
+              <div class="form-row"><label class="field-label">Officer *</label><div id="pip-officer"></div></div>
+              <div class="form-grid">
+                <div><label class="field-label">Start date</label><input type="date" id="pip-start" /></div>
+                <div><label class="field-label">End date</label><input type="date" id="pip-end" /></div>
+              </div>
+              <div class="form-row" style="margin-top:14px;"><label class="field-label">Objectives *</label><textarea id="pip-obj"></textarea></div>
+              <div class="flex-between">
+                <button class="btn btn-secondary" id="pip-cancel">Cancel</button>
+                <button class="btn btn-primary" id="pip-save">Create PIP</button>
+              </div>
+            </div>
+          </div>`;
+        const os = new OfficerSearch(document.getElementById('pip-officer'), { agencyId });
+        document.getElementById('pip-cancel').addEventListener('click', () => (root.innerHTML = ''));
+        document.getElementById('pip-save').addEventListener('click', async () => {
+          const officer = os.getValue();
+          const objectives = document.getElementById('pip-obj').value.trim();
+          if (!officer) return toast('Select an officer.', 'error');
+          if (!objectives) return toast('Objectives are required.', 'error');
+          try {
+            const { data, error } = await supabase.from('pips').insert({
+              agency_id: agencyId, officer_id: officer.id, status: 'draft',
+              start_date: document.getElementById('pip-start').value || null,
+              end_date: document.getElementById('pip-end').value || null,
+              objectives, created_by: profile.id,
+            }).select('id').single();
+            if (error) throw error;
+            await logActivity(profile, 'pip_created', 'pip', data.id, { officer_id: officer.id });
+            toast('PIP created.');
+            location.href = `pip-detail.html?id=${data.id}`;
+          } catch (e) { showError(e, 'Create PIP'); }
+        });
+      }
+    }
+  </script>
+</body>
+</html>

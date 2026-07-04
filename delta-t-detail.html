@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Delta T Case · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase, logActivity } from './supabase-client.js';
+    import {
+      escHtml, escAttr, fmtDate, daysBetween, renderLoading, renderEmpty,
+      renderErrorState, showError, toast,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('delta-t', 'Delta T Case');
+    renderLoading(content, 'Loading case…');
+
+    const id = new URLSearchParams(location.search).get('id');
+    if (!id) { renderEmpty(content, 'No case specified'); throw new Error('no id'); }
+
+    let c = null, assignments = [];
+    await load();
+
+    async function load() {
+      try {
+        const { data, error } = await supabase.from('delta_t_cases')
+          .select(`*, personnel_roster:officer_id (id, first_name, last_name, badge_number),
+                   kpi_definitions:kpi_id (id, kpi_text),
+                   source:source_review_id (id, atlas_case_number)`)
+          .eq('id', id).maybeSingle();
+        if (error) throw error;
+        if (!data) { renderEmpty(content, 'Case not found', 'It may not exist or you may not have access to it.'); return; }
+        c = data;
+        const { data: ta } = await supabase.from('training_assignments')
+          .select('*').eq('delta_t_case_id', id).order('assigned_date');
+        assignments = ta || [];
+        render();
+      } catch (e) {
+        showError(e, 'Delta T case');
+        renderErrorState(content);
+      }
+    }
+
+    function render() {
+      const today = new Date().toISOString().slice(0, 10);
+      const t1t2 = daysBetween(c.t1_incident_date, c.t2_training_delivered);
+      const t2t4 = daysBetween(c.t2_training_delivered, c.t4_verification_date);
+      const age = daysBetween(c.t1_incident_date, today);
+      const flagged = c.status === 'open' && age >= 90;
+      const canManage = ['internal_affairs', 'training_bureau', 'supervisor'].includes(profile.role);
+
+      const node = (label, date, done) => `
+        <div class="dt-node ${done ? 'done' : ''}">
+          <div class="dt-dot"></div>
+          <div class="dt-node-label">${escHtml(label)}</div>
+          <div class="dt-node-date">${date ? fmtDate(date) : 'pending'}</div>
+        </div>`;
+
+      content.innerHTML = `
+        <div class="flex-between" style="margin-bottom:16px;">
+          <h2 style="margin:0;">${escHtml(c.personnel_roster?.last_name || '')}, ${escHtml(c.personnel_roster?.first_name || '')} <span class="text-muted">#${escHtml(c.personnel_roster?.badge_number || '')}</span></h2>
+          <span>
+            ${flagged ? '<span class="pill pill-danger">⚑ open 90+ days</span>' : ''}
+            <span class="pill ${c.status === 'open' ? 'pill-warning' : 'pill-success'}">${escHtml(c.status)}</span>
+            <a class="btn btn-secondary btn-sm" href="delta-t.html">← All cases</a>
+          </span>
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Deficient KPI</h2>
+          <p style="font-size:15px;">${escHtml(c.kpi_definitions?.kpi_text || '—')}</p>
+          <p class="text-muted">Source review:
+            ${c.source ? `<a href="review-detail.html?id=${escAttr(c.source.id)}">${escHtml(c.source.atlas_case_number)}</a>` : '—'}
+            · Officer profile: <a href="officer-profile.html?id=${escAttr(c.personnel_roster?.id || '')}">view</a></p>
+
+          <div class="dt-timeline">
+            ${node('T1 · Deficiency observed', c.t1_incident_date, true)}
+            <div class="dt-line ${c.t2_training_delivered ? 'done' : ''}"></div>
+            ${node('T2 · Training delivered', c.t2_training_delivered, !!c.t2_training_delivered)}
+            <div class="dt-line ${c.t4_verification_date ? 'done' : ''}"></div>
+            ${node('T4 · KPI verified', c.t4_verification_date, !!c.t4_verification_date)}
+          </div>
+          <div class="detail-grid">
+            <div class="detail-item"><div class="dl">T1 → T2 response lag</div><div class="dv">${t1t2 !== null ? t1t2 + ' days' : 'pending training'}</div></div>
+            <div class="detail-item"><div class="dl">T2 → T4 correction lag</div><div class="dv">${t2t4 !== null ? t2t4 + ' days' : 'pending verification'}</div></div>
+            <div class="detail-item"><div class="dl">Case age</div><div class="dv">${age} days</div></div>
+          </div>
+          ${c.status === 'open' && c.t2_training_delivered && canManage ? `
+            <div style="margin-top:14px;">
+              <button class="btn btn-success" id="verify-btn">Check for verification</button>
+              <span class="text-muted" style="font-size:13px;margin-left:8px;">Closes the case if this KPI was scored Observed on a review after training delivery.</span>
+            </div>` : ''}
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Training assignments</h2>
+          <div id="ta-list">
+            ${assignments.map((a) => `
+              <div class="kpi-row">
+                <span class="kpi-text"><strong>${escHtml(a.course)}</strong>${a.description ? ` — ${escHtml(a.description)}` : ''}<br>
+                  <span class="text-muted" style="font-size:12px;">Assigned ${fmtDate(a.assigned_date)}${a.notes ? ` · ${escHtml(a.notes)}` : ''}</span></span>
+                ${a.date_delivered
+                  ? `<span class="pill pill-success">delivered ${fmtDate(a.date_delivered)}</span>`
+                  : canManage && c.status === 'open'
+                    ? `<button class="btn btn-success btn-sm deliver-btn" data-id="${escAttr(a.id)}">Mark delivered (stamps T2)</button>`
+                    : `<span class="pill pill-warning">pending</span>`}
+              </div>`).join('') || '<p class="text-muted">No training assigned yet.</p>'}
+          </div>
+          ${canManage && c.status === 'open' ? `
+            <div class="form-grid" style="margin-top:16px;align-items:end;">
+              <div><label class="field-label">Course *</label><input type="text" id="ta-course" placeholder="e.g. SFST refresher block" /></div>
+              <div><label class="field-label">Description</label><input type="text" id="ta-desc" /></div>
+              <div><label class="field-label">Notes</label><input type="text" id="ta-notes" /></div>
+              <div><button class="btn btn-primary" id="ta-add">Assign training</button></div>
+            </div>` : ''}
+        </div>`;
+
+      document.getElementById('ta-add')?.addEventListener('click', assignTraining);
+      content.querySelectorAll('.deliver-btn').forEach((b) => b.addEventListener('click', () => deliver(b.dataset.id)));
+      document.getElementById('verify-btn')?.addEventListener('click', verify);
+    }
+
+    async function assignTraining() {
+      const course = document.getElementById('ta-course').value.trim();
+      if (!course) return toast('Enter the course name.', 'error');
+      try {
+        const { data, error } = await supabase.from('training_assignments').insert({
+          agency_id: c.agency_id, delta_t_case_id: c.id, officer_id: c.officer_id,
+          course, description: document.getElementById('ta-desc').value.trim() || null,
+          notes: document.getElementById('ta-notes').value.trim() || null,
+        }).select('id').single();
+        if (error) throw error;
+        await logActivity(profile, 'training_assigned', 'training_assignment', data.id, { delta_t_case: c.id, course });
+        toast('Training assigned.');
+        await load();
+      } catch (e) { showError(e, 'Assign training'); }
+    }
+
+    // Delivering training stamps T2 on the parent Delta T case.
+    async function deliver(assignmentId) {
+      const today = new Date().toISOString().slice(0, 10);
+      try {
+        const { error: e1 } = await supabase.from('training_assignments')
+          .update({ date_delivered: today }).eq('id', assignmentId);
+        if (e1) throw e1;
+        if (!c.t2_training_delivered) {
+          const { error: e2 } = await supabase.from('delta_t_cases')
+            .update({ t2_training_delivered: today }).eq('id', c.id);
+          if (e2) throw e2;
+        }
+        await logActivity(profile, 'training_delivered', 'training_assignment', assignmentId, { delta_t_case: c.id, t2_stamped: !c.t2_training_delivered });
+        toast('Delivery recorded — T2 stamped.');
+        await load();
+      } catch (e) { showError(e, 'Mark delivered'); }
+    }
+
+    // T4: the KPI scored Observed on a later review → stamp T4 and close.
+    async function verify() {
+      try {
+        const since = c.t2_training_delivered;
+        const { data: revs, error } = await supabase.from('bwc_reviews')
+          .select('id, review_date, kpi_responses')
+          .eq('primary_officer_id', c.officer_id).eq('status', 'approved')
+          .gte('review_date', since).order('review_date');
+        if (error) throw error;
+        const hit = (revs || []).find((r) => r.kpi_responses?.[c.kpi_id] === 'observed');
+        if (!hit) { toast('Not yet verified — no post-training review shows this KPI as Observed.', 'error', 6000); return; }
+        const { error: e2 } = await supabase.from('delta_t_cases').update({
+          t4_verification_date: hit.review_date, verification_review_id: hit.id, status: 'closed',
+        }).eq('id', c.id);
+        if (e2) throw e2;
+        await logActivity(profile, 'delta_t_verified_closed', 'delta_t_case', c.id, { verification_review: hit.id });
+        toast('KPI verified Observed — case closed.');
+        await load();
+      } catch (e) { showError(e, 'Verification check'); }
+    }
+  </script>
+</body>
+</html>

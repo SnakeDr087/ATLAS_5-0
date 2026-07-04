@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agency Settings · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase, logActivity } from './supabase-client.js';
+    import { requireAgencyContext } from './agency-context.js';
+    import {
+      escHtml, escAttr, renderLoading, renderErrorState, renderEmpty,
+      showError, toast,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('agency-settings', 'Agency Settings');
+    renderLoading(content, 'Loading agency settings…');
+
+    const { agencyId } = await requireAgencyContext(profile, content);
+    if (agencyId) await init();
+
+    async function init() {
+      let agencyFull, ranks, sameRank;
+      try {
+        const [aRes, rRes, sRes] = await Promise.all([
+          supabase.from('agencies').select('*').eq('id', agencyId).single(),
+          supabase.from('agency_ranks').select('id, rank_name, rank_order, is_active')
+            .eq('agency_id', agencyId).order('rank_order'),
+          supabase.from('same_rank_permissions').select('allow_same_rank')
+            .eq('agency_id', agencyId).maybeSingle(),
+        ]);
+        if (aRes.error) throw aRes.error;
+        if (rRes.error) throw rRes.error;
+        if (sRes.error) throw sRes.error;
+        agencyFull = aRes.data;
+        ranks = rRes.data || [];
+        sameRank = sRes.data; // may be null (defaults to allowed)
+      } catch (e) {
+        showError(e, 'Agency settings'); renderErrorState(content); return;
+      }
+
+      const a = agencyFull;
+      content.innerHTML = `
+        <div class="card">
+          <h3 class="card-title">Agency Profile</h3>
+          <div class="form-grid">
+            <div class="form-row">
+              <div><label class="field-label">Agency name *</label><input id="s-name" value="${escAttr(a.name || '')}" /></div>
+              <div><label class="field-label">State</label><input id="s-state" maxlength="2" value="${escAttr(a.state || '')}" /></div>
+            </div>
+            <div class="form-row">
+              <div><label class="field-label">Address</label><input id="s-address" value="${escAttr(a.address || '')}" /></div>
+              <div><label class="field-label">City</label><input id="s-city" value="${escAttr(a.city || '')}" /></div>
+            </div>
+            <div class="form-row">
+              <div><label class="field-label">ZIP</label><input id="s-zip" value="${escAttr(a.zip || '')}" /></div>
+              <div><label class="field-label">Phone</label><input id="s-phone" value="${escAttr(a.phone || '')}" /></div>
+            </div>
+            <div class="form-row">
+              <div><label class="field-label">Website</label><input id="s-website" value="${escAttr(a.website || '')}" /></div>
+              <div><label class="field-label">Agency size</label><input id="s-size" value="${escAttr(a.agency_size || '')}" /></div>
+            </div>
+            <div><label class="field-label">Patch / logo URL (shown on printed reports)</label>
+              <input id="s-patch" placeholder="https://…/patch.png" value="${escAttr(a.patch_url || '')}" /></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:20px;">
+          <h3 class="card-title">Agency Head & ATLAS Liaison</h3>
+          <div class="form-grid">
+            <div class="form-row">
+              <div><label class="field-label">Head name</label><input id="s-hname" value="${escAttr(a.head_name || '')}" /></div>
+              <div><label class="field-label">Head title</label><input id="s-htitle" value="${escAttr(a.head_title || '')}" /></div>
+            </div>
+            <div class="form-row">
+              <div><label class="field-label">Head email</label><input id="s-hemail" type="email" value="${escAttr(a.head_email || '')}" /></div>
+              <div><label class="field-label">Head phone</label><input id="s-hphone" value="${escAttr(a.head_phone || '')}" /></div>
+            </div>
+            <div class="form-row">
+              <div><label class="field-label">Liaison name</label><input id="s-lname" value="${escAttr(a.liaison_name || '')}" /></div>
+              <div><label class="field-label">Liaison email</label><input id="s-lemail" type="email" value="${escAttr(a.liaison_email || '')}" /></div>
+            </div>
+            <div class="form-row">
+              <div><label class="field-label">Liaison phone</label><input id="s-lphone" value="${escAttr(a.liaison_phone || '')}" /></div>
+              <div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:20px;">
+          <h3 class="card-title">Review Policy</h3>
+          <div class="form-grid">
+            <div class="form-row">
+              <div><label class="field-label">Review frequency</label>
+                <select id="s-freq">
+                  ${['weekly', 'biweekly', 'monthly', 'quarterly'].map((f) =>
+                    `<option value="${f}" ${a.review_frequency === f ? 'selected' : ''}>${f}</option>`).join('')}
+                </select></div>
+              <div><label class="field-label">Minimum performance threshold (%)</label>
+                <input id="s-threshold" type="number" min="0" max="100" value="${escAttr(String(a.min_performance_threshold ?? 80))}" /></div>
+            </div>
+            <div>
+              <label class="field-label" style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                <input type="checkbox" id="s-samerank" ${(sameRank?.allow_same_rank ?? true) ? 'checked' : ''} style="width:auto;" />
+                Allow supervisors to review officers of equal rank
+              </label>
+              <p class="text-muted" style="margin:4px 0 0;">When off, the review form blocks a supervisor from selecting a primary officer whose rank order is equal to or above their own.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex-between" style="margin-top:16px;">
+          <span class="text-muted">Changes apply immediately across the agency.</span>
+          <button class="btn btn-primary" id="btn-save">Save All Settings</button>
+        </div>
+
+        <div class="card" style="margin-top:24px;">
+          <div class="flex-between">
+            <h3 class="card-title mb-0">Rank Structure</h3>
+            <button class="btn btn-primary btn-sm" id="btn-add-rank">Add Rank</button>
+          </div>
+          <p class="text-secondary" style="margin:6px 0 12px;">Ordered lowest → highest. Rank order drives the same-rank review rule.</p>
+          <div id="rank-table"></div>
+        </div>
+        <div id="modal-slot"></div>
+      `;
+
+      // ---- Save-all -------------------------------------------------------
+      document.getElementById('btn-save').addEventListener('click', async () => {
+        const v = (id) => document.getElementById(id).value.trim() || null;
+        const payload = {
+          name: v('s-name'), state: (v('s-state') || '').toUpperCase() || null,
+          address: v('s-address'), city: v('s-city'), zip: v('s-zip'),
+          phone: v('s-phone'), website: v('s-website'), agency_size: v('s-size'),
+          patch_url: v('s-patch'),
+          head_name: v('s-hname'), head_title: v('s-htitle'), head_email: v('s-hemail'), head_phone: v('s-hphone'),
+          liaison_name: v('s-lname'), liaison_email: v('s-lemail'), liaison_phone: v('s-lphone'),
+          review_frequency: document.getElementById('s-freq').value,
+          min_performance_threshold: Number(document.getElementById('s-threshold').value || 80),
+        };
+        if (!payload.name) { toast('Agency name is required.', 'error'); return; }
+        const btn = document.getElementById('btn-save');
+        btn.disabled = true;
+        try {
+          const { error } = await supabase.from('agencies').update(payload).eq('id', agencyId);
+          if (error) throw error;
+          const allow = document.getElementById('s-samerank').checked;
+          const { error: srErr } = await supabase.from('same_rank_permissions')
+            .upsert({ agency_id: agencyId, allow_same_rank: allow, updated_at: new Date().toISOString() });
+          if (srErr) throw srErr;
+          await logActivity(profile, 'agency_settings_save', 'agencies', agencyId,
+            { threshold: payload.min_performance_threshold, allow_same_rank: allow });
+          toast('Agency settings saved.', 'success');
+        } catch (e) { showError(e, 'Save settings'); }
+        btn.disabled = false;
+      });
+
+      // ---- Ranks CRUD ------------------------------------------------------
+      function renderRanks() {
+        const el = document.getElementById('rank-table');
+        if (!ranks.length) {
+          renderEmpty(el, 'No ranks defined', 'Add your rank structure so officers and users can be ranked.');
+          return;
+        }
+        el.innerHTML = `
+          <div class="table-wrap"><table class="data">
+            <thead><tr><th style="width:80px;">Order</th><th>Rank</th><th>Status</th><th></th></tr></thead>
+            <tbody>${[...ranks].sort((x, y) => x.rank_order - y.rank_order).map((r) => `
+              <tr>
+                <td>${r.rank_order}</td>
+                <td>${escHtml(r.rank_name)}</td>
+                <td><span class="pill ${r.is_active ? 'pill-success' : 'pill-danger'}">${r.is_active ? 'active' : 'retired'}</span></td>
+                <td style="white-space:nowrap;">
+                  <button class="btn btn-secondary btn-sm" data-edit-rank="${escAttr(r.id)}">Edit</button>
+                  <button class="btn ${r.is_active ? 'btn-danger' : 'btn-success'} btn-sm" data-toggle-rank="${escAttr(r.id)}">${r.is_active ? 'Retire' : 'Restore'}</button>
+                </td>
+              </tr>`).join('')}
+            </tbody></table></div>`;
+        el.querySelectorAll('[data-edit-rank]').forEach((b) => {
+          b.addEventListener('click', () => openRankModal(ranks.find((r) => r.id === b.dataset.editRank)));
+        });
+        el.querySelectorAll('[data-toggle-rank]').forEach((b) => {
+          b.addEventListener('click', async () => {
+            const r = ranks.find((x) => x.id === b.dataset.toggleRank);
+            try {
+              const { error } = await supabase.from('agency_ranks')
+                .update({ is_active: !r.is_active }).eq('id', r.id);
+              if (error) throw error;
+              r.is_active = !r.is_active;
+              await logActivity(profile, r.is_active ? 'rank_restore' : 'rank_retire', 'agency_ranks', r.id, { rank: r.rank_name });
+              toast('Rank updated.', 'success');
+              renderRanks();
+            } catch (e) { showError(e, 'Update rank'); }
+          });
+        });
+      }
+
+      function openRankModal(rank) {
+        const isEdit = !!rank;
+        const slot = document.getElementById('modal-slot');
+        const nextOrder = ranks.length ? Math.max(...ranks.map((r) => r.rank_order)) + 1 : 1;
+        slot.innerHTML = `
+          <div class="modal-backdrop">
+            <div class="modal">
+              <h3 class="card-title">${isEdit ? 'Edit Rank' : 'Add Rank'}</h3>
+              <div class="form-grid">
+                <div class="form-row">
+                  <div><label class="field-label">Rank name *</label>
+                    <input id="rk-name" value="${escAttr(rank?.rank_name || '')}" placeholder="e.g. Sergeant" /></div>
+                  <div><label class="field-label">Rank order *</label>
+                    <input id="rk-order" type="number" min="0" value="${escAttr(String(rank?.rank_order ?? nextOrder))}" /></div>
+                </div>
+              </div>
+              <div class="flex-between" style="margin-top:16px;">
+                <button class="btn btn-secondary" id="rk-cancel">Cancel</button>
+                <button class="btn btn-primary" id="rk-save">${isEdit ? 'Save' : 'Add Rank'}</button>
+              </div>
+            </div>
+          </div>`;
+        slot.querySelector('#rk-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+        slot.querySelector('#rk-save').addEventListener('click', async () => {
+          const name = slot.querySelector('#rk-name').value.trim();
+          const order = Number(slot.querySelector('#rk-order').value || 0);
+          if (!name) { toast('Rank name is required.', 'error'); return; }
+          try {
+            if (isEdit) {
+              const { error } = await supabase.from('agency_ranks')
+                .update({ rank_name: name, rank_order: order }).eq('id', rank.id);
+              if (error) throw error;
+              Object.assign(rank, { rank_name: name, rank_order: order });
+              await logActivity(profile, 'rank_update', 'agency_ranks', rank.id, { rank: name });
+            } else {
+              const { data, error } = await supabase.from('agency_ranks')
+                .insert({ agency_id: agencyId, rank_name: name, rank_order: order })
+                .select('id, rank_name, rank_order, is_active').single();
+              if (error) throw error;
+              ranks.push(data);
+              await logActivity(profile, 'rank_add', 'agency_ranks', data.id, { rank: name });
+            }
+            slot.innerHTML = '';
+            toast('Rank saved.', 'success');
+            renderRanks();
+          } catch (e) { showError(e, 'Save rank'); }
+        });
+      }
+
+      document.getElementById('btn-add-rank').addEventListener('click', () => openRankModal(null));
+      renderRanks();
+    }
+  </script>
+</body>
+</html>

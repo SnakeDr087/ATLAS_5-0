@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IA Cases · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    // Restricted queue: chief / internal_affairs / super_admin (oversight).
+    // RLS is the real gate — supervisors and training_bureau cannot SELECT.
+    import { bootPage } from './auth.js';
+    import { supabase } from './supabase-client.js';
+    import { requireAgencyContext } from './agency-context.js';
+    import {
+      escHtml, escAttr, fmtDate, renderLoading, renderEmpty, renderErrorState, showError,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('ia-cases', 'Internal Affairs Cases');
+    renderLoading(content, 'Loading IA queue…');
+
+    const { agencyId } = await requireAgencyContext(profile, content);
+    if (agencyId) await init();
+
+    async function init() {
+      let rows = [];
+      try {
+        const { data, error } = await supabase.from('ia_cases')
+          .select(`id, case_number, status, created_at, notes,
+                   personnel_roster:officer_id (first_name, last_name, badge_number),
+                   opener:opened_by (full_name)`)
+          .eq('agency_id', agencyId).order('created_at', { ascending: false });
+        if (error) throw error;
+        rows = data || [];
+      } catch (e) {
+        showError(e, 'IA cases');
+        renderErrorState(content);
+        return;
+      }
+
+      const open = rows.filter((r) => ['open', 'under_investigation'].includes(r.status));
+
+      content.innerHTML = `
+        <div class="stat-grid">
+          <div class="stat danger"><div class="stat-value">${open.length}</div><div class="stat-label">Open / investigating</div></div>
+          <div class="stat"><div class="stat-value">${rows.length}</div><div class="stat-label">All cases</div></div>
+          <div class="stat success"><div class="stat-value">${rows.filter((r) => r.status === 'closed').length}</div><div class="stat-label">Closed</div></div>
+        </div>
+        <div class="card">
+          <div class="filter-bar">
+            <div style="flex:1;min-width:200px;"><label class="field-label">Officer / case #</label><input type="text" id="f-q" /></div>
+            <div><label class="field-label">Status</label>
+              <select id="f-status"><option value="">All</option>
+                ${['open','under_investigation','closed','unfounded','sustained'].map((s) => `<option value="${s}">${escHtml(s.replace(/_/g, ' '))}</option>`).join('')}
+              </select></div>
+          </div>
+          <div class="table-wrap"><div id="table"></div></div>
+        </div>`;
+
+      const table = document.getElementById('table');
+      ['f-q', 'f-status'].forEach((id) => document.getElementById(id).addEventListener('input', paint));
+      paint();
+
+      function paint() {
+        const q = document.getElementById('f-q').value.trim().toLowerCase();
+        const st = document.getElementById('f-status').value;
+        const list = rows.filter((r) => {
+          if (q) {
+            const hay = `${r.case_number} ${r.personnel_roster?.first_name} ${r.personnel_roster?.last_name} ${r.personnel_roster?.badge_number}`.toLowerCase();
+            if (!hay.includes(q)) return false;
+          }
+          if (st && r.status !== st) return false;
+          return true;
+        });
+        if (!list.length) { renderEmpty(table, 'No IA cases match', 'Cases open automatically when a review outcome is Internal Affairs.'); return; }
+        const pill = (s) => ['closed', 'unfounded'].includes(s) ? 'pill-success' : s === 'sustained' ? 'pill-danger' : 'pill-warning';
+        table.innerHTML = `
+          <table class="data">
+            <thead><tr><th>Case #</th><th>Officer</th><th>Opened by</th><th>Opened</th><th>Status</th></tr></thead>
+            <tbody>${list.map((r) => `
+              <tr class="rowlink" data-id="${escAttr(r.id)}">
+                <td>${escHtml(r.case_number)}</td>
+                <td>${escHtml(r.personnel_roster?.last_name || '')}, ${escHtml(r.personnel_roster?.first_name || '')} <span class="text-muted">#${escHtml(r.personnel_roster?.badge_number || '')}</span></td>
+                <td>${escHtml(r.opener?.full_name || '—')}</td>
+                <td>${fmtDate(r.created_at)}</td>
+                <td><span class="pill ${pill(r.status)}">${escHtml(r.status.replace(/_/g, ' '))}</span></td>
+              </tr>`).join('')}</tbody>
+          </table>`;
+        table.querySelectorAll('.rowlink').forEach((tr) =>
+          tr.addEventListener('click', () => (location.href = `ia-case-detail.html?id=${tr.dataset.id}`)));
+      }
+    }
+  </script>
+</body>
+</html>

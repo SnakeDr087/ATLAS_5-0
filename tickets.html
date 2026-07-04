@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trouble Tickets · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase, logActivity } from './supabase-client.js';
+    import {
+      escHtml, escAttr, fmtDateTime, renderLoading, renderEmpty,
+      renderErrorState, showError, toast,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('tickets', 'Trouble Tickets');
+    const isSuper = profile.role === 'super_admin';
+
+    const STATUS_PILL = {
+      open: 'pill pill-danger', in_progress: 'pill pill-warning',
+      resolved: 'pill pill-success', closed: 'pill',
+    };
+    const PRIORITY_PILL = { low: 'pill', normal: 'pill pill-accent', high: 'pill pill-warning', urgent: 'pill pill-danger' };
+
+    let tickets = [];
+    let statusFilter = 'all';
+
+    await load();
+
+    async function load() {
+      renderLoading(content, 'Loading tickets…');
+      try {
+        // RLS scopes agency admins to their own tickets; super_admin sees all.
+        const { data, error } = await supabase.from('trouble_tickets')
+          .select(`id, subject, description, priority, status, resolution, created_at,
+                   agency:agency_id (name),
+                   submitter:submitted_by (full_name, email)`)
+          .order('created_at', { ascending: false });
+        if (error) throw error;
+        tickets = data || [];
+      } catch (e) {
+        showError(e, 'Trouble tickets'); renderErrorState(content); return;
+      }
+      render();
+    }
+
+    function render() {
+      const open = tickets.filter((t) => t.status === 'open');
+      const inProg = tickets.filter((t) => t.status === 'in_progress');
+
+      content.innerHTML = `
+        <div class="stat-grid">
+          <div class="stat ${open.length ? 'danger' : ''}"><div class="stat-value">${open.length}</div><div class="stat-label">Open</div></div>
+          <div class="stat ${inProg.length ? 'warning' : ''}"><div class="stat-value">${inProg.length}</div><div class="stat-label">In Progress</div></div>
+          <div class="stat success"><div class="stat-value">${tickets.filter((t) => t.status === 'resolved').length}</div><div class="stat-label">Resolved</div></div>
+          <div class="stat"><div class="stat-value">${tickets.length}</div><div class="stat-label">All Tickets</div></div>
+        </div>
+
+        <div class="card" style="margin-top:20px;">
+          <div class="filter-bar">
+            <select id="f-status">
+              <option value="all">All statuses</option>
+              <option value="open">Open</option>
+              <option value="in_progress">In Progress</option>
+              <option value="resolved">Resolved</option>
+              <option value="closed">Closed</option>
+            </select>
+            <div style="flex:1;"></div>
+            <button class="btn btn-primary" id="btn-new">Submit Ticket</button>
+          </div>
+          <div id="ticket-list" style="margin-top:12px;"></div>
+        </div>
+        <div id="modal-slot"></div>
+      `;
+      document.getElementById('f-status').value = statusFilter;
+      document.getElementById('f-status').addEventListener('change', (e) => { statusFilter = e.target.value; renderList(); });
+      document.getElementById('btn-new').addEventListener('click', openNewModal);
+      renderList();
+    }
+
+    function renderList() {
+      const el = document.getElementById('ticket-list');
+      const rows = tickets.filter((t) => statusFilter === 'all' || t.status === statusFilter);
+      if (!rows.length) {
+        renderEmpty(el, 'No tickets', tickets.length ? 'Adjust the status filter.' : 'Submit your first support ticket.');
+        return;
+      }
+      el.innerHTML = rows.map((t) => `
+        <div class="card" style="margin-bottom:10px;">
+          <div class="flex-between" style="flex-wrap:wrap; gap:8px;">
+            <div>
+              <strong>${escHtml(t.subject)}</strong>
+              <div class="text-muted" style="font-size:12px; margin-top:2px;">
+                ${fmtDateTime(t.created_at)} · ${escHtml(t.submitter?.full_name || 'Unknown')}
+                ${isSuper ? ` · ${escHtml(t.agency?.name || 'Platform')}` : ''}
+              </div>
+            </div>
+            <div style="display:flex; gap:6px; align-items:center;">
+              <span class="${PRIORITY_PILL[t.priority] || 'pill'}">${escHtml(t.priority || 'normal')}</span>
+              <span class="${STATUS_PILL[t.status] || 'pill'}">${escHtml(t.status.replace('_', ' '))}</span>
+            </div>
+          </div>
+          ${t.description ? `<p style="margin:10px 0 0; white-space:pre-wrap;">${escHtml(t.description)}</p>` : ''}
+          ${t.resolution ? `<div class="notice" style="margin-top:10px;"><strong>Resolution:</strong> ${escHtml(t.resolution)}</div>` : ''}
+          ${isSuper && t.status !== 'closed' ? `
+            <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap;">
+              ${t.status === 'open' ? `<button class="btn btn-secondary btn-sm" data-status="in_progress" data-id="${escAttr(t.id)}">Start Work</button>` : ''}
+              ${t.status !== 'resolved' ? `<button class="btn btn-success btn-sm" data-resolve="${escAttr(t.id)}">Resolve…</button>` : ''}
+              <button class="btn btn-secondary btn-sm" data-status="closed" data-id="${escAttr(t.id)}">Close</button>
+            </div>` : ''}
+        </div>`).join('');
+
+      el.querySelectorAll('[data-status]').forEach((b) => {
+        b.addEventListener('click', () => updateTicket(b.dataset.id, { status: b.dataset.status }));
+      });
+      el.querySelectorAll('[data-resolve]').forEach((b) => {
+        b.addEventListener('click', () => {
+          const resolution = prompt('Resolution notes:');
+          if (resolution === null) return;
+          updateTicket(b.dataset.resolve, { status: 'resolved', resolution: resolution.trim() || null });
+        });
+      });
+    }
+
+    async function updateTicket(id, patch) {
+      try {
+        const { error } = await supabase.from('trouble_tickets').update(patch).eq('id', id);
+        if (error) throw error;
+        await logActivity(profile, 'ticket_update', 'trouble_tickets', id, patch);
+        toast('Ticket updated.', 'success');
+        load();
+      } catch (e) { showError(e, 'Update ticket'); }
+    }
+
+    function openNewModal() {
+      const slot = document.getElementById('modal-slot');
+      slot.innerHTML = `
+        <div class="modal-backdrop">
+          <div class="modal">
+            <h3 class="card-title">Submit Trouble Ticket</h3>
+            <div class="form-grid">
+              <div><label class="field-label">Subject *</label><input id="tk-subject" /></div>
+              <div><label class="field-label">Priority</label>
+                <select id="tk-priority">
+                  ${['low', 'normal', 'high', 'urgent'].map((p) => `<option value="${p}" ${p === 'normal' ? 'selected' : ''}>${p}</option>`).join('')}
+                </select></div>
+              <div><label class="field-label">Description</label>
+                <textarea id="tk-desc" rows="4" placeholder="What happened, what you expected, and steps to reproduce…"></textarea></div>
+            </div>
+            <div class="flex-between" style="margin-top:16px;">
+              <button class="btn btn-secondary" id="tk-cancel">Cancel</button>
+              <button class="btn btn-primary" id="tk-submit">Submit</button>
+            </div>
+          </div>
+        </div>`;
+      slot.querySelector('#tk-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+      slot.querySelector('#tk-submit').addEventListener('click', async () => {
+        const subject = slot.querySelector('#tk-subject').value.trim();
+        if (!subject) { toast('Subject is required.', 'error'); return; }
+        const btn = slot.querySelector('#tk-submit');
+        btn.disabled = true;
+        try {
+          const { data, error } = await supabase.from('trouble_tickets').insert({
+            agency_id: profile.agency_id, // NULL for super_admin — platform ticket
+            submitted_by: profile.id,
+            subject,
+            description: slot.querySelector('#tk-desc').value.trim() || null,
+            priority: slot.querySelector('#tk-priority').value,
+          }).select('id').single();
+          if (error) throw error;
+          await logActivity(profile, 'ticket_submit', 'trouble_tickets', data.id, { subject });
+          toast('Ticket submitted.', 'success');
+          slot.innerHTML = '';
+          load();
+        } catch (e) {
+          showError(e, 'Submit ticket');
+          btn.disabled = false;
+        }
+      });
+    }
+  </script>
+</body>
+</html>

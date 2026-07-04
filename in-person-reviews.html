@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>In-Person Reviews · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    // NOTE: this page was the home of v4.3's super_admin NULL-agency bug.
+    // It uses requireAgencyContext exactly like every other agency-scoped page
+    // — never profile.agency_id directly.
+    import { bootPage } from './auth.js';
+    import { supabase, logActivity } from './supabase-client.js';
+    import { requireAgencyContext } from './agency-context.js';
+    import { OfficerSearch } from './officer-search.js';
+    import {
+      escHtml, escAttr, fmtDate, renderLoading, renderEmpty, renderErrorState,
+      showError, toast,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('in-person-reviews', 'In-Person Reviews');
+    renderLoading(content, 'Loading sessions…');
+
+    const { agencyId } = await requireAgencyContext(profile, content);
+    if (agencyId) await init();
+
+    async function init() {
+      const isSupervisor = profile.role === 'supervisor';
+      let sessions = [];
+      let statusFilter = 'upcoming';
+
+      async function loadData() {
+        let q = supabase.from('in_person_reviews')
+          .select(`id, session_date, topic, notes, completed, created_at,
+                   officer:officer_id (id, first_name, last_name, badge_number),
+                   supervisor:supervisor_id (full_name)`)
+          .eq('agency_id', agencyId)
+          .order('session_date', { ascending: false });
+        if (isSupervisor) q = q.eq('supervisor_id', profile.id);
+        const { data, error } = await q;
+        if (error) throw error;
+        sessions = data || [];
+      }
+
+      async function refresh() {
+        renderLoading(content, 'Loading sessions…');
+        try { await loadData(); } catch (e) {
+          showError(e, 'In-person reviews'); renderErrorState(content); return;
+        }
+        renderPage();
+      }
+
+      function renderPage() {
+        const todayStr = new Date().toISOString().slice(0, 10);
+        const upcoming = sessions.filter((s) => !s.completed && s.session_date >= todayStr);
+        const overdue = sessions.filter((s) => !s.completed && s.session_date < todayStr);
+        const done = sessions.filter((s) => s.completed);
+
+        content.innerHTML = `
+          <div class="stat-grid">
+            <div class="stat"><div class="stat-value">${upcoming.length}</div><div class="stat-label">Upcoming</div></div>
+            <div class="stat ${overdue.length ? 'danger' : ''}"><div class="stat-value">${overdue.length}</div><div class="stat-label">Overdue (not logged)</div></div>
+            <div class="stat success"><div class="stat-value">${done.length}</div><div class="stat-label">Completed</div></div>
+          </div>
+
+          ${(isSupervisor || ['internal_affairs', 'training_bureau'].includes(profile.role)) ? `
+          <div class="card" style="margin-top:20px;">
+            <h3 class="card-title">Schedule a Session</h3>
+            <div class="form-grid">
+              <div class="form-row">
+                <div>
+                  <label class="field-label">Officer *</label>
+                  <div id="officer-picker"></div>
+                </div>
+                <div>
+                  <label class="field-label" for="np-date">Session date *</label>
+                  <input type="date" id="np-date" value="${escAttr(todayStr)}" />
+                </div>
+              </div>
+              <div><label class="field-label" for="np-topic">Topic</label>
+                <input id="np-topic" placeholder="e.g. Quarterly performance sit-down, review of ATL-2026-00042" /></div>
+            </div>
+            <div style="margin-top:12px; text-align:right;">
+              <button class="btn btn-primary" id="btn-schedule">Schedule Session</button>
+            </div>
+          </div>` : ''}
+
+          <div class="card" style="margin-top:20px;">
+            <div class="filter-bar">
+              <select id="f-status">
+                <option value="upcoming">Upcoming</option>
+                <option value="overdue">Overdue</option>
+                <option value="completed">Completed</option>
+                <option value="all">All</option>
+              </select>
+            </div>
+            <div id="session-list" style="margin-top:12px;"></div>
+          </div>
+          <div id="modal-slot"></div>
+        `;
+
+        // Officer picker — the ONE shared OfficerSearch component.
+        let selectedOfficer = null;
+        const pickerEl = document.getElementById('officer-picker');
+        if (pickerEl) {
+          new OfficerSearch(pickerEl, {
+            agencyId,
+            supervisorId: isSupervisor ? profile.id : null, // supervisor: own roster only
+            placeholder: 'Search officer…',
+            onSelect: (o) => { selectedOfficer = o; },
+            onClear: () => { selectedOfficer = null; },
+          });
+        }
+
+        document.getElementById('btn-schedule')?.addEventListener('click', async () => {
+          const date = document.getElementById('np-date').value;
+          if (!selectedOfficer) { toast('Select an officer.', 'error'); return; }
+          if (!date) { toast('Pick a session date.', 'error'); return; }
+          try {
+            const { data, error } = await supabase.from('in_person_reviews').insert({
+              agency_id: agencyId,
+              supervisor_id: profile.id,
+              officer_id: selectedOfficer.id,
+              session_date: date,
+              topic: document.getElementById('np-topic').value.trim() || null,
+            }).select('id').single();
+            if (error) throw error;
+            await logActivity(profile, 'in_person_schedule', 'in_person_reviews', data.id,
+              { officer: `${selectedOfficer.last_name}, ${selectedOfficer.first_name}`, date });
+            toast('Session scheduled.', 'success');
+            refresh();
+          } catch (e) { showError(e, 'Schedule session'); }
+        });
+
+        document.getElementById('f-status').value = statusFilter;
+        document.getElementById('f-status').addEventListener('change', (e) => { statusFilter = e.target.value; renderList(); });
+        renderList();
+
+        function renderList() {
+          const el = document.getElementById('session-list');
+          const rows = { upcoming, overdue, completed: done, all: sessions }[statusFilter] || sessions;
+          if (!rows.length) {
+            renderEmpty(el, 'No sessions', statusFilter === 'all'
+              ? 'Schedule your first in-person review session above.'
+              : 'Nothing in this bucket — check another filter.');
+            return;
+          }
+          el.innerHTML = rows.map((s) => `
+            <div class="card" style="margin-bottom:10px;">
+              <div class="flex-between" style="flex-wrap:wrap; gap:8px;">
+                <div>
+                  <strong>
+                    <a href="officer-profile.html?officer_id=${encodeURIComponent(s.officer?.id || '')}${suffix()}">
+                      ${escHtml(s.officer ? `${s.officer.last_name}, ${s.officer.first_name}` : 'Unknown officer')}
+                    </a>
+                  </strong>
+                  <span class="text-muted">#${escHtml(s.officer?.badge_number || '')}</span>
+                  <div class="text-muted" style="font-size:12px; margin-top:2px;">
+                    ${fmtDate(s.session_date)} · ${escHtml(s.supervisor?.full_name || '')}
+                    ${s.topic ? ` · ${escHtml(s.topic)}` : ''}
+                  </div>
+                </div>
+                <div style="display:flex; gap:6px; align-items:center;">
+                  ${s.completed
+                    ? '<span class="pill pill-success">completed</span>'
+                    : (s.session_date < todayStr
+                        ? '<span class="pill pill-danger">overdue</span>'
+                        : '<span class="pill pill-warning">scheduled</span>')}
+                  ${!s.completed ? `<button class="btn btn-success btn-sm" data-log="${escAttr(s.id)}">Log Session…</button>` : ''}
+                </div>
+              </div>
+              ${s.notes ? `<p style="margin:10px 0 0; white-space:pre-wrap;">${escHtml(s.notes)}</p>` : ''}
+            </div>`).join('');
+
+          el.querySelectorAll('[data-log]').forEach((b) => {
+            b.addEventListener('click', () => openLogModal(sessions.find((x) => x.id === b.dataset.log)));
+          });
+        }
+      }
+
+      function openLogModal(s) {
+        const slot = document.getElementById('modal-slot');
+        slot.innerHTML = `
+          <div class="modal-backdrop">
+            <div class="modal">
+              <h3 class="card-title">Log Session — ${escHtml(s.officer ? `${s.officer.last_name}, ${s.officer.first_name}` : '')}</h3>
+              <div class="form-grid">
+                <div><label class="field-label">Session notes</label>
+                  <textarea id="lg-notes" rows="5" placeholder="What was discussed, agreements made, follow-ups…">${escHtml(s.notes || '')}</textarea></div>
+              </div>
+              <div class="flex-between" style="margin-top:16px;">
+                <button class="btn btn-secondary" id="lg-cancel">Cancel</button>
+                <button class="btn btn-success" id="lg-save">Mark Completed</button>
+              </div>
+            </div>
+          </div>`;
+        slot.querySelector('#lg-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+        slot.querySelector('#lg-save').addEventListener('click', async () => {
+          try {
+            const { error } = await supabase.from('in_person_reviews')
+              .update({ completed: true, notes: slot.querySelector('#lg-notes').value.trim() || null })
+              .eq('id', s.id);
+            if (error) throw error;
+            await logActivity(profile, 'in_person_complete', 'in_person_reviews', s.id, {});
+            toast('Session logged.', 'success');
+            slot.innerHTML = '';
+            refresh();
+          } catch (e) { showError(e, 'Log session'); }
+        });
+      }
+
+      function suffix() {
+        const a = new URLSearchParams(location.search).get('agency_id');
+        return a && profile.role === 'super_admin' ? `&agency_id=${encodeURIComponent(a)}` : '';
+      }
+
+      await refresh();
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Reviews · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    // Reviews list + advanced Search mode (Search page merged in per the
+    // streamlining directives — same records, one denser page).
+    import { bootPage } from './auth.js';
+    import { supabase, getEffectiveContent } from './supabase-client.js';
+    import { requireAgencyContext } from './agency-context.js';
+    import {
+      escHtml, escAttr, fmtDate, renderLoading, renderEmpty, renderErrorState,
+      showError, scoreClass, outcomeBadge, outcomeLabel,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('reviews', 'Reviews');
+    renderLoading(content, 'Loading reviews…');
+
+    const { agencyId, agency } = await requireAgencyContext(profile, content);
+    if (!agencyId) { /* super_admin picking an agency */ } else { await init(); }
+
+    async function init() {
+      const threshold = agency?.min_performance_threshold ?? 80;
+      let incidentTypes = [];
+      try {
+        incidentTypes = await getEffectiveContent('incident_type', agencyId);
+      } catch (e) { showError(e, 'Incident types'); }
+
+      content.innerHTML = `
+        <div class="stat-grid" id="stats"></div>
+        <div class="card">
+          <div class="filter-bar">
+            <div style="flex:1;min-width:220px;">
+              <label class="field-label">Search officer / case #</label>
+              <input type="text" id="f-q" placeholder="Name, badge, ATLAS or police case #" />
+            </div>
+            <div><label class="field-label">From</label><input type="date" id="f-from" /></div>
+            <div><label class="field-label">To</label><input type="date" id="f-to" /></div>
+            <div><label class="field-label">Incident type</label>
+              <select id="f-type"><option value="">All types</option>
+                ${incidentTypes.map((t) => `<option value="${escAttr(t.id)}">${escHtml(t.name)}</option>`).join('')}
+              </select></div>
+            <div><label class="field-label">Outcome</label>
+              <select id="f-outcome"><option value="">All outcomes</option>
+                ${['no_action','commendation','coaching','training','internal_affairs','pip']
+                  .map((o) => `<option value="${o}">${escHtml(outcomeLabel(o))}</option>`).join('')}
+              </select></div>
+            <div><button class="btn btn-secondary" id="f-clear">Clear</button></div>
+          </div>
+          <div id="summary" class="text-secondary" style="margin-bottom:10px;"></div>
+          <div class="table-wrap"><div id="table"></div></div>
+        </div>`;
+
+      let rows = [];
+      const table = document.getElementById('table');
+      renderLoading(table, 'Loading…');
+      try {
+        // Supervisors: RLS already limits to own reviews / own-roster officers.
+        const { data, error } = await supabase.from('bwc_reviews')
+          .select(`id, atlas_case_number, police_case_number, review_date, kpi_score,
+                   follow_up_outcome, incident_type_id,
+                   personnel_roster:primary_officer_id (id, first_name, last_name, badge_number),
+                   reviewer:reviewer_id (full_name),
+                   incident_types:incident_type_id (name)`)
+          .eq('agency_id', agencyId)
+          .order('review_date', { ascending: false })
+          .limit(500);
+        if (error) throw error;
+        rows = data || [];
+      } catch (e) {
+        showError(e, 'Reviews');
+        renderErrorState(table);
+        return;
+      }
+
+      ['f-q', 'f-from', 'f-to', 'f-type', 'f-outcome'].forEach((id) =>
+        document.getElementById(id).addEventListener('input', paint));
+      document.getElementById('f-clear').addEventListener('click', () => {
+        ['f-q', 'f-from', 'f-to', 'f-type', 'f-outcome'].forEach((id) => (document.getElementById(id).value = ''));
+        paint();
+      });
+      paint();
+
+      function filtered() {
+        const q = document.getElementById('f-q').value.trim().toLowerCase();
+        const from = document.getElementById('f-from').value;
+        const to = document.getElementById('f-to').value;
+        const type = document.getElementById('f-type').value;
+        const outcome = document.getElementById('f-outcome').value;
+        return rows.filter((r) => {
+          if (q) {
+            const hay = [
+              r.atlas_case_number, r.police_case_number,
+              r.personnel_roster?.first_name, r.personnel_roster?.last_name,
+              r.personnel_roster?.badge_number,
+              `${r.personnel_roster?.first_name} ${r.personnel_roster?.last_name}`,
+              `${r.personnel_roster?.last_name} ${r.personnel_roster?.first_name}`,
+            ].join(' ').toLowerCase();
+            if (!hay.includes(q)) return false;
+          }
+          if (from && r.review_date < from) return false;
+          if (to && r.review_date > to) return false;
+          if (type && r.incident_type_id !== type) return false;
+          if (outcome && r.follow_up_outcome !== outcome) return false;
+          return true;
+        });
+      }
+
+      function paint() {
+        const list = filtered();
+
+        // Stat cards + filtered outcome-distribution summary (the Search page's summary, merged).
+        const dist = {};
+        list.forEach((r) => { dist[r.follow_up_outcome] = (dist[r.follow_up_outcome] || 0) + 1; });
+        const avg = list.filter((r) => r.kpi_score !== null);
+        const avgScore = avg.length ? Math.round(avg.reduce((s, r) => s + Number(r.kpi_score), 0) / avg.length * 10) / 10 : null;
+
+        document.getElementById('stats').innerHTML = `
+          <div class="stat"><div class="stat-value">${list.length}</div><div class="stat-label">Reviews (filtered)</div></div>
+          <div class="stat ${avgScore === null ? '' : avgScore >= threshold ? 'success' : 'danger'}"><div class="stat-value">${avgScore ?? '—'}${avgScore !== null ? '%' : ''}</div><div class="stat-label">Avg score</div></div>
+          <div class="stat warning"><div class="stat-value">${dist.training || 0}</div><div class="stat-label">Training outcomes</div></div>
+          <div class="stat danger"><div class="stat-value">${(dist.internal_affairs || 0) + (dist.pip || 0)}</div><div class="stat-label">IA / PIP outcomes</div></div>`;
+
+        document.getElementById('summary').innerHTML = Object.keys(dist).length
+          ? 'Outcome distribution: ' + Object.entries(dist).map(([k, v]) => `${escHtml(outcomeLabel(k))} ${v}`).join(' · ')
+          : '';
+
+        if (!list.length) { renderEmpty(table, 'No reviews match', 'Adjust the filters, or author a new review.'); return; }
+        table.innerHTML = `
+          <table class="data">
+            <thead><tr><th>ATLAS #</th><th>Officer</th><th>Incident type</th><th>Reviewer</th><th>Date</th><th>Score</th><th>Outcome</th></tr></thead>
+            <tbody>
+              ${list.map((r) => `
+                <tr class="rowlink" data-id="${escAttr(r.id)}">
+                  <td>${escHtml(r.atlas_case_number)}</td>
+                  <td>${escHtml(r.personnel_roster?.last_name || '')}, ${escHtml(r.personnel_roster?.first_name || '')} <span class="text-muted">#${escHtml(r.personnel_roster?.badge_number || '')}</span></td>
+                  <td>${escHtml(r.incident_types?.name || '—')}</td>
+                  <td>${escHtml(r.reviewer?.full_name || '—')}</td>
+                  <td>${fmtDate(r.review_date)}</td>
+                  <td class="${scoreClass(r.kpi_score, threshold)}">${r.kpi_score ?? '—'}${r.kpi_score !== null ? '%' : ''}</td>
+                  <td>${outcomeBadge(r.follow_up_outcome)}</td>
+                </tr>`).join('')}
+            </tbody>
+          </table>`;
+        table.querySelectorAll('.rowlink').forEach((tr) =>
+          tr.addEventListener('click', () => (location.href = `review-detail.html?id=${tr.dataset.id}`)));
+      }
+    }
+  </script>
+</body>
+</html>

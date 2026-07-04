@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Review Detail · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase } from './supabase-client.js';
+    import {
+      escHtml, escAttr, fmtDate, renderLoading, renderErrorState, renderEmpty,
+      showError, scoreClass, outcomeBadge,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('review-detail', 'Review Detail');
+    renderLoading(content, 'Loading review…');
+
+    const id = new URLSearchParams(location.search).get('id');
+    if (!id) { renderEmpty(content, 'No review specified', 'Open a review from the Reviews list.'); throw new Error('no id'); }
+
+    try {
+      const { data: r, error } = await supabase.from('bwc_reviews')
+        .select(`*, personnel_roster:primary_officer_id (id, first_name, last_name, badge_number, agency_ranks:rank_id (rank_name)),
+                 reviewer:reviewer_id (full_name), incident_types:incident_type_id (name),
+                 agencies:agency_id (name, min_performance_threshold)`)
+        .eq('id', id).maybeSingle();
+      if (error) throw error;
+      if (!r) { renderEmpty(content, 'Review not found', 'It may not exist or you may not have access to it.'); throw new Error('not found'); }
+
+      const threshold = r.agencies?.min_performance_threshold ?? 80;
+
+      // Resolve KPI + safety item text for the stored ids.
+      const kpiIds = Object.keys(r.kpi_responses || {}).filter((k) => k !== 'universal_assessment');
+      const universalId = r.kpi_responses?.universal_assessment || null;
+      const allKpiIds = universalId ? [...kpiIds, universalId] : kpiIds;
+      const safetyIds = Object.keys(r.safety_checklist || {});
+
+      const [{ data: kpis }, { data: safety }, { data: disp }, { data: backups }] = await Promise.all([
+        allKpiIds.length ? supabase.from('kpi_definitions').select('id, kpi_text, sort_order').in('id', allKpiIds) : { data: [] },
+        safetyIds.length ? supabase.from('safety_checklist_items').select('id, item_text').in('id', safetyIds) : { data: [] },
+        supabase.from('disposition_types').select('code, label'),
+        (r.backup_officer_ids || []).length
+          ? supabase.from('personnel_roster').select('id, first_name, last_name, badge_number').in('id', r.backup_officer_ids)
+          : { data: [] },
+      ]);
+      const kpiText = Object.fromEntries((kpis || []).map((k) => [k.id, k.kpi_text]));
+      const kpiOrder = Object.fromEntries((kpis || []).map((k) => [k.id, k.sort_order]));
+      const dispLabel = Object.fromEntries((disp || []).map((d) => [d.code, d.label]));
+
+      const stateBadge = (s) => ({
+        observed: '<span class="pill pill-success">Observed</span>',
+        not_observed: '<span class="pill pill-danger">Not Observed</span>',
+        na: '<span class="pill">N/A</span>',
+      })[s] || escHtml(s);
+
+      const item = (l, v) => `<div class="detail-item"><div class="dl">${escHtml(l)}</div><div class="dv">${v}</div></div>`;
+      const loc = [r.loc_street, r.loc_apt && `Apt ${r.loc_apt}`, r.loc_floor && `Fl ${r.loc_floor}`, r.loc_city, r.loc_state]
+        .filter(Boolean).map(escHtml).join(', ') || '—';
+
+      content.innerHTML = `
+        <div class="flex-between" style="margin-bottom:16px;">
+          <h2 style="margin:0;">${escHtml(r.atlas_case_number)}</h2>
+          <span>
+            ${outcomeBadge(r.follow_up_outcome)}
+            <a class="btn btn-secondary btn-sm" href="review-report.html?id=${escAttr(r.id)}">Printable report</a>
+            <a class="btn btn-secondary btn-sm" href="officer-profile.html?id=${escAttr(r.primary_officer_id)}">Officer profile</a>
+          </span>
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Review details</h2>
+          <div class="detail-grid">
+            ${item('Police case #', escHtml(r.police_case_number || '—'))}
+            ${item('Review date', fmtDate(r.review_date))}
+            ${item('Incident date', fmtDate(r.incident_date))}
+            ${item('Recording', `${escHtml(r.recording_start || '—')} → ${escHtml(r.recording_end || '—')}`)}
+            ${item('Agency', escHtml(r.agencies?.name || '—'))}
+            ${item('Location', loc)}
+          </div>
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Personnel</h2>
+          <div class="detail-grid">
+            ${item('Primary officer', `<a href="officer-profile.html?id=${escAttr(r.primary_officer_id)}">${escHtml(r.personnel_roster?.last_name || '')}, ${escHtml(r.personnel_roster?.first_name || '')}</a> · #${escHtml(r.personnel_roster?.badge_number || '—')} · ${escHtml(r.personnel_roster?.agency_ranks?.rank_name || 'Unranked')}`)}
+            ${item('Reviewing supervisor', escHtml(r.reviewer?.full_name || '—'))}
+            ${item('Backup officers (documentation only)', (backups || []).map((b) => `${escHtml(b.last_name)}, ${escHtml(b.first_name)}`).join(' · ') || '—')}
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="flex-between">
+            <h2 class="card-title mb-0">Incident analysis — ${escHtml(r.incident_types?.name || 'Unknown type')}</h2>
+            <span class="stat-value ${scoreClass(r.kpi_score, threshold)}" style="font-size:24px;">${r.kpi_score ?? '—'}${r.kpi_score !== null ? '%' : ''}</span>
+          </div>
+          <div style="margin-top:12px;">
+            ${kpiIds.sort((a, b) => (kpiOrder[a] || 0) - (kpiOrder[b] || 0)).map((k) => `
+              <div class="kpi-row"><span class="kpi-text">${escHtml(kpiText[k] || 'KPI removed from content')}</span>${stateBadge(r.kpi_responses[k])}</div>`).join('') || '<p class="text-muted">No KPI responses recorded.</p>'}
+          </div>
+          <h3 style="margin:18px 0 6px;">Universal Performance Assessment</h3>
+          <p>${universalId ? escHtml(kpiText[universalId] || '—') : '—'}</p>
+          <h3 style="margin:18px 0 6px;">Officer safety deficiencies ${safetyIds.length ? `<span class="pill pill-danger">${safetyIds.length}</span>` : ''}</h3>
+          ${(safety || []).map((s) => `<div class="kpi-row"><span class="kpi-text">${escHtml(s.item_text)}</span><span class="pill pill-danger">flagged</span></div>`).join('') || '<p class="text-muted">None flagged.</p>'}
+          <h3 style="margin:18px 0 6px;">Dispositions</h3>
+          <p>${(r.dispositions || []).map((c) => `<span class="pill">${escHtml(dispLabel[c] || c)}</span>`).join(' ') || '—'}</p>
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Supervisor notes</h2>
+          <h3 style="margin:0 0 6px;">Report-facing notes <span class="pill pill-accent">printed</span></h3>
+          <p style="white-space:pre-wrap;">${escHtml(r.report_notes || '—')}</p>
+          ${r.internal_notes !== null && r.internal_notes !== undefined ? `
+            <h3 style="margin:18px 0 6px;">Internal notes <span class="pill pill-danger">confidential — never printed</span></h3>
+            <p style="white-space:pre-wrap;">${escHtml(r.internal_notes || '—')}</p>` : ''}
+        </div>`;
+    } catch (e) {
+      if (!['no id', 'not found'].includes(e.message)) { showError(e, 'Review detail'); renderErrorState(content); }
+    }
+  </script>
+</body>
+</html>

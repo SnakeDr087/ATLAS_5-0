@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PIP Detail · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase, logActivity } from './supabase-client.js';
+    import {
+      escHtml, escAttr, fmtDate, renderLoading, renderEmpty, renderErrorState,
+      showError, toast, scoreClass, outcomeBadge,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('pips', 'PIP Detail');
+    renderLoading(content, 'Loading PIP…');
+
+    const id = new URLSearchParams(location.search).get('id');
+    if (!id) { renderEmpty(content, 'No PIP specified'); throw new Error('no id'); }
+
+    const canManage = ['internal_affairs', 'training_bureau'].includes(profile.role);
+    const canGrant = ['internal_affairs', 'training_bureau', 'chief', 'super_admin'].includes(profile.role);
+    let p = null, linked = [], recentReviews = [], accessList = [], agencyUsers = [];
+
+    await load();
+
+    async function load() {
+      try {
+        const { data, error } = await supabase.from('pips')
+          .select(`*, personnel_roster:officer_id (id, first_name, last_name, badge_number),
+                   creator:created_by (full_name)`)
+          .eq('id', id).maybeSingle();
+        if (error) throw error;
+        if (!data) { renderEmpty(content, 'PIP not found', 'It may not exist or you may not have access to it.'); return; }
+        p = data;
+
+        const [{ data: lr }, { data: rr }, { data: al }, { data: users }] = await Promise.all([
+          (p.linked_reviews || []).length
+            ? supabase.from('bwc_reviews').select('id, atlas_case_number, review_date, kpi_score, follow_up_outcome').in('id', p.linked_reviews)
+            : { data: [] },
+          supabase.from('bwc_reviews').select('id, atlas_case_number, review_date, kpi_score, follow_up_outcome')
+            .eq('primary_officer_id', p.officer_id).order('review_date', { ascending: false }).limit(12),
+          supabase.from('pip_access_list').select('id, profile_id, profiles:profile_id (full_name, role)').eq('pip_id', id),
+          canGrant ? supabase.from('profiles').select('id, full_name, role').eq('agency_id', p.agency_id).eq('is_active', true).order('full_name') : { data: [] },
+        ]);
+        linked = lr || []; recentReviews = rr || []; accessList = al || []; agencyUsers = users || [];
+        render();
+      } catch (e) {
+        showError(e, 'PIP detail');
+        renderErrorState(content);
+      }
+    }
+
+    function render() {
+      const pill = (s) => s === 'active' ? 'pill-warning' : s === 'completed' ? 'pill-success' : s === 'terminated' ? 'pill-danger' : 'pill';
+      const linkedIds = new Set(linked.map((r) => r.id));
+      const linkable = recentReviews.filter((r) => !linkedIds.has(r.id));
+      const grantable = agencyUsers.filter((u) => !accessList.some((a) => a.profile_id === u.id));
+
+      const reviewRow = (r, action = '') => `
+        <div class="kpi-row">
+          <span class="kpi-text"><a href="review-detail.html?id=${escAttr(r.id)}">${escHtml(r.atlas_case_number)}</a>
+            · ${fmtDate(r.review_date)} · <span class="${scoreClass(r.kpi_score)}">${r.kpi_score ?? '—'}%</span> ${outcomeBadge(r.follow_up_outcome)}</span>
+          ${action}
+        </div>`;
+
+      content.innerHTML = `
+        <div class="flex-between" style="margin-bottom:16px;">
+          <h2 style="margin:0;">PIP — ${escHtml(p.personnel_roster?.last_name || '')}, ${escHtml(p.personnel_roster?.first_name || '')} <span class="text-muted">#${escHtml(p.personnel_roster?.badge_number || '')}</span></h2>
+          <span><span class="pill ${pill(p.status)}">${escHtml(p.status)}</span>
+          <a class="btn btn-secondary btn-sm" href="pips.html">← All PIPs</a></span>
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Plan</h2>
+          <div class="detail-grid" style="margin-bottom:14px;">
+            <div class="detail-item"><div class="dl">Start</div><div class="dv">${fmtDate(p.start_date)}</div></div>
+            <div class="detail-item"><div class="dl">End</div><div class="dv">${fmtDate(p.end_date)}</div></div>
+            <div class="detail-item"><div class="dl">Created by</div><div class="dv">${escHtml(p.creator?.full_name || '—')}</div></div>
+            <div class="detail-item"><div class="dl">Officer profile</div><div class="dv"><a href="officer-profile.html?id=${escAttr(p.personnel_roster?.id || '')}">View →</a></div></div>
+          </div>
+          <label class="field-label">Objectives</label>
+          ${canManage
+            ? `<textarea id="f-obj">${escHtml(p.objectives || '')}</textarea>`
+            : `<p style="white-space:pre-wrap;">${escHtml(p.objectives || '—')}</p>`}
+          ${canManage ? `
+            <div class="form-grid" style="margin-top:12px;align-items:end;">
+              <div><label class="field-label">Status</label>
+                <select id="f-status">${['draft','active','completed','terminated'].map((s) => `<option value="${s}"${s === p.status ? ' selected' : ''}>${escHtml(s)}</option>`).join('')}</select></div>
+              <div><label class="field-label">Start</label><input type="date" id="f-start" value="${escAttr(p.start_date || '')}" /></div>
+              <div><label class="field-label">End</label><input type="date" id="f-end" value="${escAttr(p.end_date || '')}" /></div>
+              <div><button class="btn btn-primary" id="save-btn">Save changes</button></div>
+            </div>` : ''}
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Linked reviews</h2>
+          ${linked.map((r) => reviewRow(r, canManage ? `<button class="btn btn-secondary btn-sm unlink-btn" data-id="${escAttr(r.id)}">Unlink</button>` : '')).join('') || '<p class="text-muted">No reviews linked to this plan yet.</p>'}
+          ${canManage && linkable.length ? `
+            <h3 style="margin:16px 0 6px;">Officer's recent reviews — link as evidence</h3>
+            ${linkable.map((r) => reviewRow(r, `<button class="btn btn-secondary btn-sm link-btn" data-id="${escAttr(r.id)}">Link</button>`)).join('')}` : ''}
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Named access grants</h2>
+          ${accessList.map((a) => `
+            <div class="kpi-row">
+              <span class="kpi-text">${escHtml(a.profiles?.full_name || '—')} <span class="pill">${escHtml(a.profiles?.role || '')}</span></span>
+              ${canGrant ? `<button class="btn btn-danger btn-sm revoke-btn" data-id="${escAttr(a.id)}">Revoke</button>` : ''}
+            </div>`).join('') || '<p class="text-muted">No named grants — role defaults only.</p>'}
+          ${canGrant && grantable.length ? `
+            <div class="form-grid" style="margin-top:14px;align-items:end;">
+              <div><label class="field-label">Grant access to</label>
+                <select id="f-grant">${grantable.map((u) => `<option value="${escAttr(u.id)}">${escHtml(u.full_name)} (${escHtml(u.role)})</option>`).join('')}</select></div>
+              <div><button class="btn btn-primary" id="grant-btn">Grant access</button></div>
+            </div>` : ''}
+        </div>`;
+
+      document.getElementById('save-btn')?.addEventListener('click', save);
+      document.getElementById('grant-btn')?.addEventListener('click', grant);
+      content.querySelectorAll('.link-btn').forEach((b) => b.addEventListener('click', () => linkReview(b.dataset.id, true)));
+      content.querySelectorAll('.unlink-btn').forEach((b) => b.addEventListener('click', () => linkReview(b.dataset.id, false)));
+      content.querySelectorAll('.revoke-btn').forEach((b) => b.addEventListener('click', () => revoke(b.dataset.id)));
+    }
+
+    async function save() {
+      try {
+        const update = {
+          status: document.getElementById('f-status').value,
+          start_date: document.getElementById('f-start').value || null,
+          end_date: document.getElementById('f-end').value || null,
+          objectives: document.getElementById('f-obj').value.trim(),
+        };
+        const { error } = await supabase.from('pips').update(update).eq('id', p.id);
+        if (error) throw error;
+        await logActivity(profile, 'pip_updated', 'pip', p.id, { status: update.status });
+        toast('PIP saved.');
+        await load();
+      } catch (e) { showError(e, 'Save PIP'); }
+    }
+
+    async function linkReview(reviewId, add) {
+      try {
+        const next = add
+          ? [...(p.linked_reviews || []), reviewId]
+          : (p.linked_reviews || []).filter((r) => r !== reviewId);
+        const { error } = await supabase.from('pips').update({ linked_reviews: next }).eq('id', p.id);
+        if (error) throw error;
+        await logActivity(profile, add ? 'pip_review_linked' : 'pip_review_unlinked', 'pip', p.id, { review: reviewId });
+        await load();
+      } catch (e) { showError(e, 'Link review'); }
+    }
+
+    async function grant() {
+      try {
+        const { error } = await supabase.from('pip_access_list')
+          .insert({ pip_id: p.id, profile_id: document.getElementById('f-grant').value, granted_by: profile.id });
+        if (error) throw error;
+        await logActivity(profile, 'pip_access_granted', 'pip', p.id);
+        toast('Access granted.');
+        await load();
+      } catch (e) { showError(e, 'Grant access'); }
+    }
+
+    async function revoke(grantId) {
+      try {
+        const { error } = await supabase.from('pip_access_list').delete().eq('id', grantId);
+        if (error) throw error;
+        await logActivity(profile, 'pip_access_revoked', 'pip', p.id, { grant: grantId });
+        toast('Access revoked.');
+        await load();
+      } catch (e) { showError(e, 'Revoke access'); }
+    }
+  </script>
+</body>
+</html>

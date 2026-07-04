@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>New Review · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase, logActivity, getEffectiveContent } from './supabase-client.js';
+    import { resolveAgencyId } from './agency-context.js';
+    import { OfficerSearch } from './officer-search.js';
+    import {
+      escHtml, escAttr, renderLoading, renderErrorState, showError, toast,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('review-new', 'New BWC Review');
+    const agencyId = resolveAgencyId(profile); // ia/tb/supervisor always have one
+    renderLoading(content, 'Loading review form…');
+
+    const STATES = ['observed', 'not_observed', 'na'];
+    const STATE_LABEL = { observed: 'Observed', not_observed: 'Not Observed', na: 'N/A' };
+    const US_STATES = 'AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC'.split(' ');
+
+    let incidentTypes = [], universalKpis = [], safetyItems = [], dispositions = [];
+    let kpisForType = [];              // current incident type's KPI list
+    const kpiState = {};               // kpi_id -> observed/not_observed/na
+    let universalPick = null;
+    let outcomePick = 'no_action';
+    let primaryOS, backupOS;
+    const backups = [];                // {id, first_name, last_name, badge_number}
+    let sameRankRule = true;
+    let submitting = false;
+
+    try {
+      [incidentTypes, universalKpis, safetyItems, dispositions] = await Promise.all([
+        getEffectiveContent('incident_type', agencyId),
+        getEffectiveContent('kpi', agencyId, (q) => q.is('incident_type_id', null)),
+        getEffectiveContent('safety_item', agencyId),
+        getEffectiveContent('disposition', agencyId),
+      ]);
+      const { data: srp } = await supabase.from('same_rank_permissions')
+        .select('allow_same_rank').eq('agency_id', agencyId).maybeSingle();
+      if (srp) sameRankRule = srp.allow_same_rank;
+      renderForm();
+    } catch (e) {
+      showError(e, 'New review');
+      renderErrorState(content, 'Could not load the review form.');
+    }
+
+    function renderForm() {
+      content.innerHTML = `
+        <nav class="section-nav" aria-label="Form sections">
+          <a href="#sec-details">1 · Review Details</a>
+          <a href="#sec-location">2 · Incident Location</a>
+          <a href="#sec-personnel">3 · Personnel</a>
+          <a href="#sec-analysis">4 · Incident Analysis</a>
+          <a href="#sec-outcome">5 · Follow-Up &amp; Outcome</a>
+          <a href="#sec-notes">6 · Supervisor Notes</a>
+        </nav>
+
+        <!-- 1 · REVIEW DETAILS -->
+        <div class="card" id="sec-details">
+          <h2 class="card-title">1 · Review Details</h2>
+          <div class="form-grid">
+            <div><label class="field-label">ATLAS case #</label><input type="text" readonly value="Auto-generated on submit" /></div>
+            <div><label class="field-label">Police case #</label><input type="text" id="f-police-case" /></div>
+            <div><label class="field-label">Review date</label><input type="date" id="f-review-date" /></div>
+            <div><label class="field-label">Incident date</label><input type="date" id="f-incident-date" /></div>
+            <div><label class="field-label">Recording start</label><input type="time" id="f-rec-start" /></div>
+            <div><label class="field-label">Recording end</label><input type="time" id="f-rec-end" /></div>
+            <div><label class="field-label">Agency</label><input type="text" readonly value="${escAttr(profile.agency?.name || '')}" /></div>
+          </div>
+        </div>
+
+        <!-- 2 · INCIDENT LOCATION -->
+        <div class="card" id="sec-location">
+          <h2 class="card-title">2 · Incident Location</h2>
+          <div class="form-grid">
+            <div style="grid-column:span 2;"><label class="field-label">Street address</label><input type="text" id="f-street" /></div>
+            <div><label class="field-label">Apt / Suite</label><input type="text" id="f-apt" /></div>
+            <div><label class="field-label">Floor</label><input type="text" id="f-floor" /></div>
+            <div><label class="field-label">City</label><input type="text" id="f-city" /></div>
+            <div><label class="field-label">State</label>
+              <select id="f-state"><option value="">—</option>${US_STATES.map((s) => `<option${s === (profile.agency?.state || '') ? ' selected' : ''}>${s}</option>`).join('')}</select>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3 · PERSONNEL -->
+        <div class="card" id="sec-personnel">
+          <h2 class="card-title">3 · Personnel</h2>
+          <div class="form-grid">
+            <div><label class="field-label">Reviewing supervisor</label><input type="text" readonly value="${escAttr(profile.full_name)}" /></div>
+            <div><label class="field-label">Primary officer *</label><div id="primary-officer"></div></div>
+            <div><label class="field-label">Backup officers <span class="text-muted" style="text-transform:none;">(documentation only — no score impact)</span></label>
+              <div id="backup-officer"></div>
+              <div id="backup-tags" style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4 · INCIDENT ANALYSIS -->
+        <div class="card" id="sec-analysis">
+          <h2 class="card-title">4 · Incident Analysis</h2>
+          <div class="form-row" style="max-width:400px;">
+            <label class="field-label">Incident type *</label>
+            <select id="f-incident-type">
+              <option value="">Select incident type…</option>
+              ${incidentTypes.map((t) => `<option value="${escAttr(t.id)}">${escHtml(t.name)}</option>`).join('')}
+            </select>
+          </div>
+          <div id="kpi-block"><p class="text-muted">Select an incident type to load its KPI checklist.</p></div>
+
+          <h3 style="margin:24px 0 6px;">Universal Performance Assessment *</h3>
+          <p class="text-secondary" style="margin:0 0 10px;font-size:13px;">Single overall rating — shown on every review.</p>
+          <div id="universal-block">
+            ${universalKpis.map((k) => `
+              <label class="check-item" style="padding:5px 0;">
+                <input type="radio" name="universal" value="${escAttr(k.id)}" />
+                <span>${escHtml(k.kpi_text)}</span>
+              </label>`).join('')}
+          </div>
+
+          <div style="margin-top:24px;border:1px solid var(--border);border-radius:10px;padding:14px 16px;">
+            <div class="collapse-head" id="safety-toggle">
+              <h3 class="mb-0 mt-0">Officer Safety Deficiencies <span class="pill pill-danger" id="safety-count" hidden>0</span></h3>
+              <span class="text-muted" id="safety-chevron">▸ expand</span>
+            </div>
+            <div id="safety-body" hidden>
+              <div class="check-grid">
+                ${safetyItems.map((s) => `
+                  <label class="check-item"><input type="checkbox" class="safety-cb" value="${escAttr(s.id)}" /><span>${escHtml(s.item_text)}</span></label>`).join('')}
+              </div>
+            </div>
+          </div>
+
+          <h3 style="margin:24px 0 6px;">Dispositions</h3>
+          <div class="check-grid">
+            ${dispositions.map((d) => `
+              <label class="check-item"><input type="checkbox" class="disp-cb" value="${escAttr(d.code)}" /><span>${escHtml(d.label)}</span></label>`).join('')}
+          </div>
+        </div>
+
+        <!-- 5 · FOLLOW-UP & OUTCOME -->
+        <div class="card" id="sec-outcome">
+          <h2 class="card-title">5 · Follow-Up Action &amp; Outcome</h2>
+          <div class="outcome-grid" id="outcome-grid">
+            ${[
+              ['no_action', 'No Action', 'Performance meets standards; no follow-up required.'],
+              ['commendation', 'Commendation', 'Exemplary performance recognized in the officer\u2019s file.'],
+              ['coaching', 'Coaching', 'Informal corrective conversation by the supervisor.'],
+              ['training', 'Training', 'Formal training — opens Delta T intervention tracking.'],
+              ['internal_affairs', 'Internal Affairs', 'Refer to IA for investigation.'],
+              ['pip', 'PIP', 'Performance Improvement Plan referral.'],
+            ].map(([code, name, desc]) => `
+              <button type="button" class="outcome-card oc-${code}${code === 'no_action' ? ' selected' : ''}" data-code="${code}">
+                <span class="oc-name">${escHtml(name)}</span>
+                <span class="oc-desc">${escHtml(desc)}</span>
+              </button>`).join('')}
+          </div>
+          <div id="outcome-notice"></div>
+        </div>
+
+        <!-- 6 · SUPERVISOR NOTES -->
+        <div class="card" id="sec-notes">
+          <h2 class="card-title">6 · Supervisor Notes</h2>
+          <div class="form-row">
+            <label class="field-label">Internal notes <span class="text-muted" style="text-transform:none;">(confidential — never printed)</span></label>
+            <textarea id="f-internal-notes"></textarea>
+          </div>
+          <div class="form-row">
+            <label class="field-label">Report-facing notes * <span class="text-muted" style="text-transform:none;">(printed — goes in the officer's file)</span></label>
+            <textarea id="f-report-notes"></textarea>
+          </div>
+          <div class="flex-between">
+            <span class="text-muted">Score is computed as Observed ÷ (Observed + Not Observed); N/A excluded.</span>
+            <button class="btn btn-primary" id="submit-btn">Submit review</button>
+          </div>
+        </div>`;
+
+      document.getElementById('f-review-date').value = new Date().toISOString().slice(0, 10);
+
+      // Officer components — THE shared OfficerSearch, scoped by role.
+      const scope = profile.role === 'supervisor' ? { supervisorId: profile.id } : {};
+      primaryOS = new OfficerSearch(document.getElementById('primary-officer'), { agencyId, ...scope });
+      backupOS = new OfficerSearch(document.getElementById('backup-officer'), {
+        agencyId, ...scope, placeholder: 'Add backup officer…',
+        onSelect: (o) => { if (o) { addBackup(o); backupOS.clear(); } },
+      });
+
+      // Incident type → KPI list
+      document.getElementById('f-incident-type').addEventListener('change', loadKpis);
+
+      // Safety collapsible + count badge
+      const safetyToggle = document.getElementById('safety-toggle');
+      safetyToggle.addEventListener('click', () => {
+        const body = document.getElementById('safety-body');
+        body.hidden = !body.hidden;
+        document.getElementById('safety-chevron').textContent = body.hidden ? '▸ expand' : '▾ collapse';
+      });
+      content.querySelectorAll('.safety-cb').forEach((cb) => cb.addEventListener('change', () => {
+        const n = content.querySelectorAll('.safety-cb:checked').length;
+        const badge = document.getElementById('safety-count');
+        badge.hidden = n === 0; badge.textContent = String(n);
+      }));
+
+      // Universal single-select
+      content.querySelectorAll('input[name="universal"]').forEach((r) =>
+        r.addEventListener('change', () => { universalPick = r.value; }));
+
+      // Outcome cards
+      document.getElementById('outcome-grid').querySelectorAll('.outcome-card').forEach((card) => {
+        card.addEventListener('click', () => {
+          outcomePick = card.dataset.code;
+          content.querySelectorAll('.outcome-card').forEach((c) => c.classList.toggle('selected', c === card));
+          const box = document.getElementById('outcome-notice');
+          if (outcomePick === 'training') {
+            box.innerHTML = `<div class="notice notice-warning">Delta T will auto-open — one case per <strong>Not Observed</strong> KPI, with no duplicates for existing open officer+KPI cases.</div>`;
+          } else if (outcomePick === 'internal_affairs') {
+            box.innerHTML = `<div class="notice notice-danger">IA referral opens immediately upon submission. The Chief is auto-notified, and you lose visibility of the IA case.</div>`;
+          } else {
+            box.innerHTML = '';
+          }
+        });
+      });
+
+      document.getElementById('submit-btn').addEventListener('click', submit);
+
+      // Prefill from an Auto Select receipt (?officer_id=&incident_type_id=)
+      const params = new URLSearchParams(location.search);
+      const pType = params.get('incident_type_id');
+      if (pType && incidentTypes.some((t) => t.id === pType)) {
+        document.getElementById('f-incident-type').value = pType;
+        loadKpis();
+      }
+    }
+
+    async function loadKpis() {
+      const typeId = document.getElementById('f-incident-type').value;
+      const block = document.getElementById('kpi-block');
+      Object.keys(kpiState).forEach((k) => delete kpiState[k]);
+      if (!typeId) { block.innerHTML = '<p class="text-muted">Select an incident type to load its KPI checklist.</p>'; return; }
+      renderLoading(block, 'Loading KPIs…');
+      try {
+        kpisForType = await getEffectiveContent('kpi', agencyId, (q) => q.eq('incident_type_id', typeId));
+        if (!kpisForType.length) { block.innerHTML = '<p class="text-muted">No KPIs are defined for this incident type.</p>'; return; }
+        block.innerHTML = `
+          <div class="flex-between" style="margin-bottom:6px;">
+            <strong>${kpisForType.length} KPIs</strong>
+            <span>
+              <button type="button" class="btn btn-secondary btn-sm" id="bulk-observed">All Observed</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="bulk-na">All N/A</button>
+            </span>
+          </div>
+          ${kpisForType.map((k) => `
+            <div class="kpi-row" data-kpi="${escAttr(k.id)}">
+              <span class="kpi-text">${escHtml(k.kpi_text)}</span>
+              <span class="tri-group">
+                ${STATES.map((s) => `<button type="button" class="tri-btn" data-state="${s}">${STATE_LABEL[s]}</button>`).join('')}
+              </span>
+            </div>`).join('')}`;
+        block.querySelectorAll('.kpi-row').forEach((row) => {
+          row.querySelectorAll('.tri-btn').forEach((btn) => btn.addEventListener('click', () => setKpi(row, btn.dataset.state)));
+        });
+        document.getElementById('bulk-observed').addEventListener('click', () =>
+          block.querySelectorAll('.kpi-row').forEach((r) => setKpi(r, 'observed')));
+        document.getElementById('bulk-na').addEventListener('click', () =>
+          block.querySelectorAll('.kpi-row').forEach((r) => setKpi(r, 'na')));
+      } catch (e) {
+        showError(e, 'KPI load');
+        block.innerHTML = '<p class="text-muted">Could not load KPIs for this type.</p>';
+      }
+    }
+
+    function setKpi(row, state) {
+      kpiState[row.dataset.kpi] = state;
+      row.querySelectorAll('.tri-btn').forEach((b) => {
+        b.className = 'tri-btn' + (b.dataset.state === state ? ` sel-${state}` : '');
+      });
+    }
+
+    function addBackup(o) {
+      if (backups.some((b) => b.id === o.id)) return;
+      const primary = primaryOS.getValue();
+      if (primary && primary.id === o.id) { toast('That officer is already the primary.', 'error'); return; }
+      backups.push(o);
+      paintBackups();
+    }
+
+    function paintBackups() {
+      const box = document.getElementById('backup-tags');
+      box.innerHTML = backups.map((b, i) => `
+        <span class="pill pill-accent">${escHtml(b.last_name)}, ${escHtml(b.first_name)}
+          <button type="button" class="os-clear" data-i="${i}" aria-label="Remove">×</button></span>`).join('');
+      box.querySelectorAll('.os-clear').forEach((btn) =>
+        btn.addEventListener('click', () => { backups.splice(Number(btn.dataset.i), 1); paintBackups(); }));
+    }
+
+    // ------------------------------------------------------------- submission
+    async function submit() {
+      if (submitting) return;
+      const officer = primaryOS.getValue();
+      const typeId = document.getElementById('f-incident-type').value;
+      const reportNotes = document.getElementById('f-report-notes').value.trim();
+
+      if (!officer) return toast('Select a primary officer.', 'error');
+      if (!typeId) return toast('Select an incident type.', 'error');
+      const unanswered = kpisForType.filter((k) => !kpiState[k.id]);
+      if (unanswered.length) return toast(`Answer all KPIs — ${unanswered.length} remaining.`, 'error');
+      if (!universalPick) return toast('Select a Universal Performance Assessment rating.', 'error');
+      if (!reportNotes) return toast('Report-facing notes are required.', 'error');
+
+      // Same-rank rule (agency setting) — supervisors only.
+      if (profile.role === 'supervisor' && !sameRankRule && profile.rank_id && officer.rank_id
+          && profile.rank_id === officer.rank_id) {
+        return toast('Your agency does not permit reviewing officers of equal rank.', 'error');
+      }
+
+      const btn = document.getElementById('submit-btn');
+      submitting = true; btn.disabled = true; btn.textContent = 'Submitting…';
+      try {
+        // Score: observed / (observed + not_observed), N/A excluded.
+        const vals = Object.values(kpiState);
+        const obs = vals.filter((v) => v === 'observed').length;
+        const not = vals.filter((v) => v === 'not_observed').length;
+        const score = obs + not === 0 ? null : Math.round((obs / (obs + not)) * 1000) / 10;
+
+        const safetyChecklist = {};
+        content.querySelectorAll('.safety-cb:checked').forEach((cb) => { safetyChecklist[cb.value] = true; });
+        const dispCodes = [...content.querySelectorAll('.disp-cb:checked')].map((cb) => cb.value);
+        const typeName = incidentTypes.find((t) => t.id === typeId)?.name || '';
+
+        const review = {
+          agency_id: agencyId,
+          police_case_number: document.getElementById('f-police-case').value.trim() || null,
+          reviewer_id: profile.id,
+          primary_officer_id: officer.id,
+          backup_officer_ids: backups.map((b) => b.id),
+          review_date: document.getElementById('f-review-date').value || new Date().toISOString().slice(0, 10),
+          incident_date: document.getElementById('f-incident-date').value || null,
+          recording_start: document.getElementById('f-rec-start').value || null,
+          recording_end: document.getElementById('f-rec-end').value || null,
+          loc_street: document.getElementById('f-street').value.trim() || null,
+          loc_apt: document.getElementById('f-apt').value.trim() || null,
+          loc_floor: document.getElementById('f-floor').value.trim() || null,
+          loc_city: document.getElementById('f-city').value.trim() || null,
+          loc_state: document.getElementById('f-state').value || null,
+          incident_type_id: typeId,
+          kpi_responses: { ...kpiState, universal_assessment: universalPick },
+          safety_checklist: safetyChecklist,
+          dispositions: dispCodes,
+          kpi_score: score,
+          follow_up_outcome: outcomePick,
+          is_ia_referral: outcomePick === 'internal_affairs',
+          internal_notes: document.getElementById('f-internal-notes').value.trim() || null,
+          report_notes: reportNotes,
+          status: 'approved', // officer running score is refreshed by DB trigger
+        };
+
+        const { data: inserted, error } = await supabase
+          .from('bwc_reviews').insert(review).select('id, atlas_case_number').single();
+        if (error) throw error;
+
+        await logActivity(profile, 'review_submitted', 'bwc_review', inserted.id,
+          { atlas_case_number: inserted.atlas_case_number, officer_id: officer.id, score, outcome: outcomePick });
+
+        // Outcome: TRAINING → auto-open Delta T, one per Not Observed KPI,
+        // skipping existing open officer+KPI cases (no duplicates).
+        if (outcomePick === 'training') {
+          const failed = Object.entries(kpiState).filter(([, v]) => v === 'not_observed').map(([id]) => id);
+          if (failed.length) {
+            const { data: existing } = await supabase.from('delta_t_cases')
+              .select('kpi_id').eq('officer_id', officer.id).eq('status', 'open').in('kpi_id', failed);
+            const openKpis = new Set((existing || []).map((c) => c.kpi_id));
+            const newCases = failed.filter((k) => !openKpis.has(k)).map((kpi_id) => ({
+              agency_id: agencyId, officer_id: officer.id, kpi_id,
+              source_review_id: inserted.id, status: 'open',
+              t1_incident_date: review.incident_date || review.review_date,
+            }));
+            if (newCases.length) {
+              const { data: dtRows, error: dtErr } = await supabase.from('delta_t_cases').insert(newCases).select('id');
+              if (dtErr) throw dtErr;
+              for (const c of dtRows || []) {
+                await logActivity(profile, 'delta_t_opened', 'delta_t_case', c.id, { source_review: inserted.id });
+              }
+              toast(`${dtRows.length} Delta T case${dtRows.length > 1 ? 's' : ''} opened.`, 'success');
+            }
+          }
+        }
+
+        // Outcome: INTERNAL AFFAIRS → auto-create IA case; the submitting
+        // supervisor loses visibility (RLS denies their SELECT). Chief notified.
+        if (outcomePick === 'internal_affairs') {
+          const caseNumber = `IA-${new Date().getFullYear()}-${Date.now().toString(36).toUpperCase()}`;
+          const { data: iaRow, error: iaErr } = await supabase.from('ia_cases').insert({
+            agency_id: agencyId, officer_id: officer.id, source_review_id: inserted.id,
+            case_number: caseNumber, status: 'open', opened_by: profile.id,
+            notes: `Auto-opened from BWC review ${inserted.atlas_case_number} (${typeName}).`,
+          }).select('id').single();
+          if (iaErr) throw iaErr;
+          await logActivity(profile, 'ia_referral_opened', 'ia_case', iaRow.id,
+            { case_number: caseNumber, chief_notified: true, source_review: inserted.id });
+          toast('IA case opened — the Chief has been notified. You no longer have visibility of this case.', 'success', 6500);
+        }
+
+        toast(`Review submitted — ${inserted.atlas_case_number}`, 'success', 6000);
+        setTimeout(() => (location.href = `review-detail.html?id=${inserted.id}`), 1200);
+      } catch (e) {
+        showError(e, 'Submit failed');
+        submitting = false; btn.disabled = false; btn.textContent = 'Submit review';
+      }
+    }
+  </script>
+</body>
+</html>

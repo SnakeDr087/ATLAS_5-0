@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IA Case · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase, logActivity } from './supabase-client.js';
+    import {
+      escHtml, escAttr, fmtDate, renderLoading, renderEmpty, renderErrorState,
+      showError, toast,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('ia-cases', 'IA Case Detail');
+    renderLoading(content, 'Loading case…');
+
+    const id = new URLSearchParams(location.search).get('id');
+    if (!id) { renderEmpty(content, 'No case specified'); throw new Error('no id'); }
+
+    const canManage = ['internal_affairs', 'super_admin'].includes(profile.role);
+    const canGrant = ['internal_affairs', 'chief', 'super_admin'].includes(profile.role);
+    let c = null, accessList = [], agencyUsers = [];
+
+    await load();
+
+    async function load() {
+      try {
+        const { data, error } = await supabase.from('ia_cases')
+          .select(`*, personnel_roster:officer_id (id, first_name, last_name, badge_number),
+                   opener:opened_by (full_name),
+                   source:source_review_id (id, atlas_case_number)`)
+          .eq('id', id).maybeSingle();
+        if (error) throw error;
+        if (!data) { renderEmpty(content, 'Case not found', 'It may not exist or you may not have access to it.'); return; }
+        c = data;
+
+        const [{ data: al }, { data: users }] = await Promise.all([
+          supabase.from('ia_access_list').select('id, profile_id, profiles:profile_id (full_name, role)').eq('ia_case_id', id),
+          canGrant ? supabase.from('profiles').select('id, full_name, role').eq('agency_id', c.agency_id).eq('is_active', true).order('full_name') : { data: [] },
+        ]);
+        accessList = al || [];
+        agencyUsers = users || [];
+        render();
+      } catch (e) {
+        showError(e, 'IA case');
+        renderErrorState(content);
+      }
+    }
+
+    function render() {
+      const pill = (s) => ['closed', 'unfounded'].includes(s) ? 'pill-success' : s === 'sustained' ? 'pill-danger' : 'pill-warning';
+      const grantable = agencyUsers.filter((u) => !accessList.some((a) => a.profile_id === u.id));
+
+      content.innerHTML = `
+        <div class="flex-between" style="margin-bottom:16px;">
+          <h2 style="margin:0;">${escHtml(c.case_number)}</h2>
+          <span><span class="pill ${pill(c.status)}">${escHtml(c.status.replace(/_/g, ' '))}</span>
+          <a class="btn btn-secondary btn-sm" href="ia-cases.html">← All cases</a></span>
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Case information</h2>
+          <div class="detail-grid">
+            <div class="detail-item"><div class="dl">Officer</div><div class="dv"><a href="officer-profile.html?id=${escAttr(c.personnel_roster?.id || '')}">${escHtml(c.personnel_roster?.last_name || '')}, ${escHtml(c.personnel_roster?.first_name || '')}</a> · #${escHtml(c.personnel_roster?.badge_number || '—')}</div></div>
+            <div class="detail-item"><div class="dl">Opened by</div><div class="dv">${escHtml(c.opener?.full_name || '—')} <span class="text-muted">(submitter has no case visibility)</span></div></div>
+            <div class="detail-item"><div class="dl">Opened</div><div class="dv">${fmtDate(c.created_at)}</div></div>
+            <div class="detail-item"><div class="dl">Source review</div><div class="dv">${c.source ? `<a href="review-detail.html?id=${escAttr(c.source.id)}">${escHtml(c.source.atlas_case_number)}</a>` : '—'}</div></div>
+          </div>
+          ${canManage ? `
+            <div class="form-grid" style="margin-top:16px;align-items:end;">
+              <div><label class="field-label">Status</label>
+                <select id="f-status">${['open','under_investigation','closed','unfounded','sustained']
+                  .map((s) => `<option value="${s}"${s === c.status ? ' selected' : ''}>${escHtml(s.replace(/_/g, ' '))}</option>`).join('')}</select></div>
+              <div><button class="btn btn-primary" id="save-status">Update status</button></div>
+            </div>` : ''}
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Case notes</h2>
+          <p style="white-space:pre-wrap;">${escHtml(c.notes || '—')}</p>
+          ${canManage ? `
+            <div class="form-row"><textarea id="f-note" placeholder="Append a case note…"></textarea></div>
+            <button class="btn btn-secondary" id="add-note">Append note</button>` : ''}
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Named access grants <span class="pill">beyond role defaults</span></h2>
+          ${accessList.map((a) => `
+            <div class="kpi-row">
+              <span class="kpi-text">${escHtml(a.profiles?.full_name || '—')} <span class="pill">${escHtml(a.profiles?.role || '')}</span></span>
+              ${canGrant ? `<button class="btn btn-danger btn-sm revoke-btn" data-id="${escAttr(a.id)}">Revoke</button>` : ''}
+            </div>`).join('') || '<p class="text-muted">No named grants — role defaults only (Chief, IA, platform oversight).</p>'}
+          ${canGrant && grantable.length ? `
+            <div class="form-grid" style="margin-top:14px;align-items:end;">
+              <div><label class="field-label">Grant access to</label>
+                <select id="f-grant">${grantable.map((u) => `<option value="${escAttr(u.id)}">${escHtml(u.full_name)} (${escHtml(u.role)})</option>`).join('')}</select></div>
+              <div><button class="btn btn-primary" id="grant-btn">Grant access</button></div>
+            </div>` : ''}
+        </div>`;
+
+      document.getElementById('save-status')?.addEventListener('click', saveStatus);
+      document.getElementById('add-note')?.addEventListener('click', addNote);
+      document.getElementById('grant-btn')?.addEventListener('click', grant);
+      content.querySelectorAll('.revoke-btn').forEach((b) => b.addEventListener('click', () => revoke(b.dataset.id)));
+    }
+
+    async function saveStatus() {
+      const status = document.getElementById('f-status').value;
+      try {
+        const { error } = await supabase.from('ia_cases').update({ status }).eq('id', c.id);
+        if (error) throw error;
+        await logActivity(profile, 'ia_status_changed', 'ia_case', c.id, { status });
+        toast('Status updated.');
+        await load();
+      } catch (e) { showError(e, 'Update status'); }
+    }
+
+    async function addNote() {
+      const note = document.getElementById('f-note').value.trim();
+      if (!note) return toast('Enter a note first.', 'error');
+      const stamped = `${c.notes ? c.notes + '\n\n' : ''}[${new Date().toISOString().slice(0, 10)} · ${profile.full_name}] ${note}`;
+      try {
+        const { error } = await supabase.from('ia_cases').update({ notes: stamped }).eq('id', c.id);
+        if (error) throw error;
+        await logActivity(profile, 'ia_note_added', 'ia_case', c.id);
+        toast('Note appended.');
+        await load();
+      } catch (e) { showError(e, 'Append note'); }
+    }
+
+    async function grant() {
+      const profileId = document.getElementById('f-grant').value;
+      try {
+        const { error } = await supabase.from('ia_access_list')
+          .insert({ ia_case_id: c.id, profile_id: profileId, granted_by: profile.id });
+        if (error) throw error;
+        await logActivity(profile, 'ia_access_granted', 'ia_case', c.id, { grantee: profileId });
+        toast('Access granted.');
+        await load();
+      } catch (e) { showError(e, 'Grant access'); }
+    }
+
+    async function revoke(grantId) {
+      try {
+        const { error } = await supabase.from('ia_access_list').delete().eq('id', grantId);
+        if (error) throw error;
+        await logActivity(profile, 'ia_access_revoked', 'ia_case', c.id, { grant: grantId });
+        toast('Access revoked.');
+        await load();
+      } catch (e) { showError(e, 'Revoke access'); }
+    }
+  </script>
+</body>
+</html>

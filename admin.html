@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Admin Panel · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase, logActivity } from './supabase-client.js';
+    import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
+    import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+    import {
+      escHtml, escAttr, fmtDate, fmtDateTime, renderLoading, renderEmpty,
+      renderErrorState, showError, toast,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('admin', 'Admin Panel');
+    const isSuper = profile.role === 'super_admin';
+
+    // Secondary client with no session persistence — used ONLY to create auth
+    // accounts (signUp) without disturbing the admin's own session.
+    const provisioningClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+
+    const ROLES = isSuper
+      ? ['super_admin', 'chief', 'internal_affairs', 'training_bureau', 'agency_admin', 'supervisor']
+      : ['chief', 'internal_affairs', 'training_bureau', 'agency_admin', 'supervisor'];
+    const ROLE_LABEL = {
+      super_admin: 'Super Admin', chief: 'Chief / Executive', internal_affairs: 'Internal Affairs',
+      training_bureau: 'Training Bureau', agency_admin: 'Agency Admin', supervisor: 'Supervisor',
+    };
+
+    let agencies = [];
+    let tab = new URLSearchParams(location.search).get('tab') ||
+      (isSuper ? 'agencies' : 'users');
+
+    await boot();
+
+    async function boot() {
+      renderLoading(content, 'Loading admin panel…');
+      try {
+        const { data, error } = await supabase.from('agencies')
+          .select('id, name, state, city, head_name, head_title, agency_size, review_frequency, min_performance_threshold, is_active, created_at')
+          .order('name');
+        if (error) throw error;
+        agencies = data || [];
+      } catch (e) {
+        showError(e, 'Admin panel'); renderErrorState(content); return;
+      }
+      renderShell();
+    }
+
+    function renderShell() {
+      const tabs = [
+        ...(isSuper ? [['agencies', 'Agencies']] : []),
+        ['users', 'Users'],
+        ['requests', 'Access Requests'],
+      ];
+      content.innerHTML = `
+        <div class="tabs">
+          ${tabs.map(([k, label]) => `<button class="tab ${tab === k ? 'active' : ''}" data-tab="${k}">${label}</button>`).join('')}
+        </div>
+        <div id="tab-body" style="margin-top:20px;"></div>
+        <div id="modal-slot"></div>
+      `;
+      content.querySelectorAll('[data-tab]').forEach((b) => {
+        b.addEventListener('click', () => {
+          tab = b.dataset.tab;
+          const p = new URLSearchParams(location.search); p.set('tab', tab);
+          history.replaceState(null, '', `?${p}`);
+          renderShell();
+        });
+      });
+      const body = document.getElementById('tab-body');
+      if (tab === 'agencies' && isSuper) renderAgencies(body);
+      else if (tab === 'requests') renderRequests(body);
+      else renderUsers(body);
+    }
+
+    // =====================================================================
+    // TAB: AGENCIES (super_admin) — list + expandable detail + 4-step wizard
+    // =====================================================================
+    async function renderAgencies(body) {
+      body.innerHTML = `
+        <div class="flex-between" style="margin-bottom:14px;">
+          <h3 class="card-title mb-0">Agencies (${agencies.length})</h3>
+          <button class="btn btn-primary" id="btn-new-agency">Create Agency</button>
+        </div>
+        <div id="agency-list"></div>`;
+      body.querySelector('#btn-new-agency').addEventListener('click', openWizard);
+
+      const list = body.querySelector('#agency-list');
+      if (!agencies.length) {
+        renderEmpty(list, 'No agencies yet', 'Create your first agency with the wizard.');
+        return;
+      }
+
+      // Per-agency quick stats in one round trip each (kept lazy on expand).
+      list.innerHTML = agencies.map((a) => `
+        <div class="card" style="margin-bottom:12px;">
+          <div class="flex-between collapse-head" data-expand="${escAttr(a.id)}" style="cursor:pointer;">
+            <div>
+              <strong>${escHtml(a.name)}</strong>
+              <span class="text-muted" style="margin-left:8px;">${escHtml([a.city, a.state].filter(Boolean).join(', '))}</span>
+            </div>
+            <div>
+              <span class="pill ${a.is_active ? 'pill-success' : 'pill-danger'}">${a.is_active ? 'active' : 'inactive'}</span>
+              <span class="pill">floor ${escHtml(String(a.min_performance_threshold))}%</span>
+            </div>
+          </div>
+          <div class="agency-detail" id="detail-${escAttr(a.id)}" style="display:none; margin-top:12px;"></div>
+        </div>`).join('');
+
+      list.querySelectorAll('[data-expand]').forEach((head) => {
+        head.addEventListener('click', async () => {
+          const id = head.dataset.expand;
+          const panel = document.getElementById(`detail-${id}`);
+          if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+          panel.style.display = 'block';
+          if (panel.dataset.loaded) return;
+          renderLoading(panel, 'Loading agency stats…');
+          try {
+            const [users, officers, reviews] = await Promise.all([
+              supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('agency_id', id),
+              supabase.from('personnel_roster').select('id', { count: 'exact', head: true }).eq('agency_id', id),
+              supabase.from('bwc_reviews').select('id', { count: 'exact', head: true }).eq('agency_id', id),
+            ]);
+            const a = agencies.find((x) => x.id === id);
+            panel.innerHTML = `
+              <div class="stat-grid">
+                <div class="stat"><div class="stat-value">${users.count ?? 0}</div><div class="stat-label">Users</div></div>
+                <div class="stat"><div class="stat-value">${officers.count ?? 0}</div><div class="stat-label">Officers</div></div>
+                <div class="stat"><div class="stat-value">${reviews.count ?? 0}</div><div class="stat-label">Reviews</div></div>
+              </div>
+              <div class="detail-grid" style="margin-top:12px;">
+                <div class="detail-item"><div class="dl">Agency head</div><div class="dv">${escHtml(a.head_name || '—')}${a.head_title ? `, ${escHtml(a.head_title)}` : ''}</div></div>
+                <div class="detail-item"><div class="dl">Size</div><div class="dv">${escHtml(a.agency_size || '—')}</div></div>
+                <div class="detail-item"><div class="dl">Review frequency</div><div class="dv">${escHtml(a.review_frequency || '—')}</div></div>
+                <div class="detail-item"><div class="dl">Created</div><div class="dv">${fmtDate(a.created_at)}</div></div>
+              </div>
+              <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap;">
+                <a class="btn btn-secondary btn-sm" href="dashboard.html?agency_id=${encodeURIComponent(id)}">Open Dashboard</a>
+                <a class="btn btn-secondary btn-sm" href="roster.html?agency_id=${encodeURIComponent(id)}">Roster</a>
+                <a class="btn btn-secondary btn-sm" href="agency-settings.html?agency_id=${encodeURIComponent(id)}">Settings</a>
+                <a class="btn btn-secondary btn-sm" href="content-manager.html?agency_id=${encodeURIComponent(id)}">Content</a>
+                <button class="btn ${a.is_active ? 'btn-danger' : 'btn-success'} btn-sm" data-toggle-agency="${escAttr(id)}">
+                  ${a.is_active ? 'Deactivate Agency' : 'Reactivate Agency'}
+                </button>
+              </div>`;
+            panel.dataset.loaded = '1';
+            panel.querySelector('[data-toggle-agency]').addEventListener('click', async (ev) => {
+              ev.stopPropagation();
+              const a2 = agencies.find((x) => x.id === id);
+              if (!confirm(`${a2.is_active ? 'Deactivate' : 'Reactivate'} ${a2.name}?`)) return;
+              try {
+                const { error } = await supabase.from('agencies')
+                  .update({ is_active: !a2.is_active }).eq('id', id);
+                if (error) throw error;
+                await logActivity(profile, a2.is_active ? 'agency_deactivate' : 'agency_reactivate', 'agencies', id, { name: a2.name });
+                toast('Agency updated.', 'success');
+                boot();
+              } catch (e) { showError(e, 'Update agency'); }
+            });
+          } catch (e) {
+            showError(e, 'Agency stats');
+            panel.innerHTML = '<p class="text-muted">Could not load stats.</p>';
+          }
+        });
+      });
+    }
+
+    // ---- 4-step agency creation wizard ----------------------------------
+    function openWizard() {
+      const slot = document.getElementById('modal-slot');
+      const w = {
+        step: 1,
+        agency: { name: '', state: '', city: '', address: '', zip: '', phone: '', website: '', agency_size: '', review_frequency: 'monthly', min_performance_threshold: 80 },
+        head: { head_name: '', head_title: '', head_email: '', head_phone: '', liaison_name: '', liaison_email: '', liaison_phone: '' },
+        admin: { full_name: '', email: '', password: '' },
+      };
+
+      function draw() {
+        const steps = ['Agency Info', 'Head & Liaison', 'Initial Admin', 'Confirm'];
+        slot.innerHTML = `
+          <div class="modal-backdrop">
+            <div class="modal" style="max-width:680px;">
+              <h3 class="card-title">Create Agency — Step ${w.step} of 4</h3>
+              <div class="tabs" style="margin-bottom:14px;">
+                ${steps.map((s, i) => `<span class="tab ${w.step === i + 1 ? 'active' : ''}" style="pointer-events:none;">${i + 1}. ${s}</span>`).join('')}
+              </div>
+              <div id="wiz-body"></div>
+              <div class="flex-between" style="margin-top:16px;">
+                <button class="btn btn-secondary" id="wiz-back">${w.step === 1 ? 'Cancel' : 'Back'}</button>
+                <button class="btn btn-primary" id="wiz-next">${w.step === 4 ? 'Create Agency' : 'Next'}</button>
+              </div>
+            </div>
+          </div>`;
+        const bodyEl = slot.querySelector('#wiz-body');
+
+        if (w.step === 1) {
+          bodyEl.innerHTML = `
+            <div class="form-grid">
+              <div class="form-row">
+                <div><label class="field-label">Agency name *</label><input id="wa-name" value="${escAttr(w.agency.name)}" /></div>
+                <div><label class="field-label">State</label><input id="wa-state" maxlength="2" placeholder="NJ" value="${escAttr(w.agency.state)}" /></div>
+              </div>
+              <div class="form-row">
+                <div><label class="field-label">City</label><input id="wa-city" value="${escAttr(w.agency.city)}" /></div>
+                <div><label class="field-label">ZIP</label><input id="wa-zip" value="${escAttr(w.agency.zip)}" /></div>
+              </div>
+              <div><label class="field-label">Address</label><input id="wa-address" value="${escAttr(w.agency.address)}" /></div>
+              <div class="form-row">
+                <div><label class="field-label">Phone</label><input id="wa-phone" value="${escAttr(w.agency.phone)}" /></div>
+                <div><label class="field-label">Website</label><input id="wa-website" value="${escAttr(w.agency.website)}" /></div>
+              </div>
+              <div class="form-row">
+                <div><label class="field-label">Agency size</label><input id="wa-size" placeholder="e.g. 50-100 sworn" value="${escAttr(w.agency.agency_size)}" /></div>
+                <div><label class="field-label">Review frequency</label>
+                  <select id="wa-freq">
+                    ${['weekly', 'biweekly', 'monthly', 'quarterly'].map((f) => `<option value="${f}" ${w.agency.review_frequency === f ? 'selected' : ''}>${f}</option>`).join('')}
+                  </select></div>
+              </div>
+              <div class="form-row">
+                <div><label class="field-label">Minimum performance threshold (%)</label>
+                  <input id="wa-threshold" type="number" min="0" max="100" value="${escAttr(String(w.agency.min_performance_threshold))}" /></div>
+                <div></div>
+              </div>
+            </div>`;
+        } else if (w.step === 2) {
+          bodyEl.innerHTML = `
+            <h4 class="mt-0">Agency Head</h4>
+            <div class="form-grid">
+              <div class="form-row">
+                <div><label class="field-label">Name</label><input id="wh-name" value="${escAttr(w.head.head_name)}" /></div>
+                <div><label class="field-label">Title</label><input id="wh-title" placeholder="Chief of Police" value="${escAttr(w.head.head_title)}" /></div>
+              </div>
+              <div class="form-row">
+                <div><label class="field-label">Email</label><input id="wh-email" type="email" value="${escAttr(w.head.head_email)}" /></div>
+                <div><label class="field-label">Phone</label><input id="wh-phone" value="${escAttr(w.head.head_phone)}" /></div>
+              </div>
+            </div>
+            <h4>ATLAS Liaison</h4>
+            <div class="form-grid">
+              <div><label class="field-label">Name</label><input id="wl-name" value="${escAttr(w.head.liaison_name)}" /></div>
+              <div class="form-row">
+                <div><label class="field-label">Email</label><input id="wl-email" type="email" value="${escAttr(w.head.liaison_email)}" /></div>
+                <div><label class="field-label">Phone</label><input id="wl-phone" value="${escAttr(w.head.liaison_phone)}" /></div>
+              </div>
+            </div>`;
+        } else if (w.step === 3) {
+          bodyEl.innerHTML = `
+            <p class="text-secondary mt-0">This creates the agency's first <strong>Agency Admin</strong> account. They can sign in immediately with this temporary password and should change it via "Forgot password."</p>
+            <div class="form-grid">
+              <div><label class="field-label">Full name *</label><input id="wu-name" value="${escAttr(w.admin.full_name)}" /></div>
+              <div class="form-row">
+                <div><label class="field-label">Email *</label><input id="wu-email" type="email" value="${escAttr(w.admin.email)}" /></div>
+                <div><label class="field-label">Temporary password *</label><input id="wu-pass" type="text" placeholder="min 8 characters" value="${escAttr(w.admin.password)}" /></div>
+              </div>
+            </div>
+            <div class="notice notice-warning" style="margin-top:10px;">
+              If your Supabase project requires email confirmation, the admin must confirm their email before first sign-in.
+            </div>`;
+        } else {
+          bodyEl.innerHTML = `
+            <div class="detail-grid">
+              <div class="detail-item"><div class="dl">Agency</div><div class="dv">${escHtml(w.agency.name)} (${escHtml(w.agency.state || '—')})</div></div>
+              <div class="detail-item"><div class="dl">Threshold</div><div class="dv">${escHtml(String(w.agency.min_performance_threshold))}%</div></div>
+              <div class="detail-item"><div class="dl">Agency head</div><div class="dv">${escHtml(w.head.head_name || '—')}</div></div>
+              <div class="detail-item"><div class="dl">Initial admin</div><div class="dv">${escHtml(w.admin.full_name)} &lt;${escHtml(w.admin.email)}&gt;</div></div>
+            </div>
+            <p class="text-secondary" style="margin-top:12px;">On create: the agency record is written, the admin auth account is provisioned, their profile is linked, and a default rank set can be added later in Agency Settings.</p>`;
+        }
+
+        slot.querySelector('#wiz-back').addEventListener('click', () => {
+          if (w.step === 1) { slot.innerHTML = ''; return; }
+          collect(); w.step--; draw();
+        });
+        slot.querySelector('#wiz-next').addEventListener('click', async () => {
+          collect();
+          if (w.step === 1 && !w.agency.name.trim()) { toast('Agency name is required.', 'error'); return; }
+          if (w.step === 3) {
+            if (!w.admin.full_name.trim() || !w.admin.email.trim()) { toast('Admin name and email are required.', 'error'); return; }
+            if ((w.admin.password || '').length < 8) { toast('Temporary password must be at least 8 characters.', 'error'); return; }
+          }
+          if (w.step < 4) { w.step++; draw(); return; }
+          await createAgency();
+        });
+
+        function collect() {
+          const v = (id) => slot.querySelector(id)?.value ?? null;
+          if (w.step === 1) {
+            Object.assign(w.agency, {
+              name: v('#wa-name') ?? w.agency.name, state: (v('#wa-state') || '').toUpperCase(),
+              city: v('#wa-city'), zip: v('#wa-zip'), address: v('#wa-address'),
+              phone: v('#wa-phone'), website: v('#wa-website'), agency_size: v('#wa-size'),
+              review_frequency: v('#wa-freq') || w.agency.review_frequency,
+              min_performance_threshold: Number(v('#wa-threshold') || 80),
+            });
+          } else if (w.step === 2) {
+            Object.assign(w.head, {
+              head_name: v('#wh-name'), head_title: v('#wh-title'), head_email: v('#wh-email'), head_phone: v('#wh-phone'),
+              liaison_name: v('#wl-name'), liaison_email: v('#wl-email'), liaison_phone: v('#wl-phone'),
+            });
+          } else if (w.step === 3) {
+            Object.assign(w.admin, { full_name: v('#wu-name'), email: v('#wu-email'), password: v('#wu-pass') });
+          }
+        }
+      }
+
+      async function createAgency() {
+        const btn = slot.querySelector('#wiz-next');
+        btn.disabled = true; btn.textContent = 'Creating…';
+        try {
+          // 1) Agency record
+          const { data: agencyRow, error: aErr } = await supabase.from('agencies')
+            .insert({ ...w.agency, ...w.head }).select('id, name').single();
+          if (aErr) throw aErr;
+
+          // 2) Auth account via non-persistent client (admin session untouched)
+          const { data: signUpData, error: sErr } = await provisioningClient.auth.signUp({
+            email: w.admin.email.trim(), password: w.admin.password,
+          });
+          if (sErr) throw sErr;
+          const newUserId = signUpData.user?.id;
+          if (!newUserId) throw new Error('Auth account was not created — check Supabase auth settings.');
+
+          // 3) Profile linked to agency (profiles.id === auth.users.id)
+          const { error: pErr } = await supabase.from('profiles').insert({
+            id: newUserId, agency_id: agencyRow.id, role: 'agency_admin',
+            full_name: w.admin.full_name.trim(), email: w.admin.email.trim(), is_active: true,
+          });
+          if (pErr) throw pErr;
+
+          await logActivity(profile, 'agency_create', 'agencies', agencyRow.id,
+            { name: agencyRow.name, initial_admin: w.admin.email });
+          toast(`Agency "${agencyRow.name}" created with admin ${w.admin.email}.`, 'success');
+          slot.innerHTML = '';
+          boot();
+        } catch (e) {
+          showError(e, 'Create agency');
+          btn.disabled = false; btn.textContent = 'Create Agency';
+        }
+      }
+
+      draw();
+    }
+
+    // =====================================================================
+    // TAB: USERS
+    // =====================================================================
+    async function renderUsers(body) {
+      renderLoading(body, 'Loading users…');
+      let agencyFilter = isSuper ? (new URLSearchParams(location.search).get('agency_id') || 'all') : profile.agency_id;
+
+      let users = [];
+      let ranks = [];
+      try {
+        let q = supabase.from('profiles')
+          .select('id, full_name, email, role, is_active, agency_id, rank_id, created_at, agency:agency_id (name)')
+          .order('full_name');
+        if (!isSuper) q = q.eq('agency_id', profile.agency_id);
+        const { data, error } = await q;
+        if (error) throw error;
+        users = data || [];
+
+        const rankAgency = isSuper ? (agencyFilter !== 'all' ? agencyFilter : null) : profile.agency_id;
+        if (rankAgency) {
+          const { data: rData, error: rErr } = await supabase.from('agency_ranks')
+            .select('id, rank_name').eq('agency_id', rankAgency).eq('is_active', true).order('rank_order');
+          if (rErr) throw rErr;
+          ranks = rData || [];
+        }
+      } catch (e) {
+        showError(e, 'Users'); renderErrorState(body); return;
+      }
+
+      function visible() {
+        if (!isSuper || agencyFilter === 'all') return users;
+        if (agencyFilter === 'platform') return users.filter((u) => !u.agency_id);
+        return users.filter((u) => u.agency_id === agencyFilter);
+      }
+
+      function draw() {
+        const rows = visible();
+        body.innerHTML = `
+          <div class="flex-between" style="margin-bottom:14px; flex-wrap:wrap; gap:10px;">
+            <h3 class="card-title mb-0">Users (${rows.length})</h3>
+            <div style="display:flex; gap:8px;">
+              ${isSuper ? `
+                <select id="u-agency">
+                  <option value="all">All agencies</option>
+                  <option value="platform" ${agencyFilter === 'platform' ? 'selected' : ''}>Platform (no agency)</option>
+                  ${agencies.map((a) => `<option value="${escAttr(a.id)}" ${agencyFilter === a.id ? 'selected' : ''}>${escHtml(a.name)}</option>`).join('')}
+                </select>` : ''}
+              <button class="btn btn-primary" id="btn-add-user">Add User</button>
+            </div>
+          </div>
+          <div id="user-table"></div>`;
+
+        if (isSuper) {
+          body.querySelector('#u-agency').addEventListener('change', (e) => {
+            agencyFilter = e.target.value;
+            renderUsers(body); // reload ranks for the chosen agency
+          });
+        }
+        body.querySelector('#btn-add-user').addEventListener('click', () => openUserModal(null));
+
+        const tbl = body.querySelector('#user-table');
+        if (!rows.length) {
+          renderEmpty(tbl, 'No users', 'Add a user or adjust the agency filter.');
+          return;
+        }
+        tbl.innerHTML = `
+          <div class="table-wrap"><table class="data">
+            <thead><tr><th>Name</th><th>Email</th><th>Role</th>${isSuper ? '<th>Agency</th>' : ''}<th>Status</th><th></th></tr></thead>
+            <tbody>${rows.map((u) => `
+              <tr>
+                <td>${escHtml(u.full_name)}</td>
+                <td class="text-muted">${escHtml(u.email)}</td>
+                <td><span class="pill pill-accent">${escHtml(ROLE_LABEL[u.role] || u.role)}</span></td>
+                ${isSuper ? `<td>${escHtml(u.agency?.name || 'Platform')}</td>` : ''}
+                <td><span class="pill ${u.is_active ? 'pill-success' : 'pill-danger'}">${u.is_active ? 'active' : 'deactivated'}</span></td>
+                <td style="white-space:nowrap;">
+                  <button class="btn btn-secondary btn-sm" data-edit-user="${escAttr(u.id)}">Edit</button>
+                  ${u.id !== profile.id ? `<button class="btn ${u.is_active ? 'btn-danger' : 'btn-success'} btn-sm" data-toggle-user="${escAttr(u.id)}">${u.is_active ? 'Deactivate' : 'Reactivate'}</button>` : ''}
+                </td>
+              </tr>`).join('')}
+            </tbody></table></div>`;
+
+        tbl.querySelectorAll('[data-edit-user]').forEach((b) => {
+          b.addEventListener('click', () => openUserModal(users.find((u) => u.id === b.dataset.editUser)));
+        });
+        tbl.querySelectorAll('[data-toggle-user]').forEach((b) => {
+          b.addEventListener('click', async () => {
+            const u = users.find((x) => x.id === b.dataset.toggleUser);
+            if (!confirm(`${u.is_active ? 'Deactivate' : 'Reactivate'} ${u.full_name}? ${u.is_active ? 'They will be blocked at sign-in.' : ''}`)) return;
+            try {
+              const { error } = await supabase.from('profiles')
+                .update({ is_active: !u.is_active }).eq('id', u.id);
+              if (error) throw error;
+              await logActivity(profile, u.is_active ? 'user_deactivate' : 'user_reactivate', 'profiles', u.id, { email: u.email });
+              toast('User updated.', 'success');
+              renderUsers(body);
+            } catch (e) { showError(e, 'Update user'); }
+          });
+        });
+      }
+
+      // ---- Add / Edit user modal ----------------------------------------
+      function openUserModal(user) {
+        const isEdit = !!user;
+        const slot = document.getElementById('modal-slot');
+        const targetAgency = isEdit
+          ? user.agency_id
+          : (isSuper ? (agencyFilter !== 'all' && agencyFilter !== 'platform' ? agencyFilter : '') : profile.agency_id);
+
+        slot.innerHTML = `
+          <div class="modal-backdrop">
+            <div class="modal">
+              <h3 class="card-title">${isEdit ? 'Edit User' : 'Add User'}</h3>
+              <div class="form-grid">
+                <div><label class="field-label">Full name *</label>
+                  <input id="um-name" value="${escAttr(user?.full_name || '')}" /></div>
+                <div><label class="field-label">Email *</label>
+                  <input id="um-email" type="email" value="${escAttr(user?.email || '')}" ${isEdit ? 'disabled' : ''} /></div>
+                ${!isEdit ? `
+                <div><label class="field-label">Temporary password *</label>
+                  <input id="um-pass" type="text" placeholder="min 8 characters" /></div>` : ''}
+                <div class="form-row">
+                  <div><label class="field-label">Role *</label>
+                    <select id="um-role">
+                      ${ROLES.map((r) => `<option value="${r}" ${user?.role === r ? 'selected' : ''}>${ROLE_LABEL[r]}</option>`).join('')}
+                    </select></div>
+                  ${isSuper ? `
+                  <div><label class="field-label">Agency</label>
+                    <select id="um-agency">
+                      <option value="">Platform (no agency)</option>
+                      ${agencies.map((a) => `<option value="${escAttr(a.id)}" ${targetAgency === a.id ? 'selected' : ''}>${escHtml(a.name)}</option>`).join('')}
+                    </select></div>` : ''}
+                </div>
+                ${ranks.length ? `
+                <div><label class="field-label">Rank</label>
+                  <select id="um-rank">
+                    <option value="">— None —</option>
+                    ${ranks.map((r) => `<option value="${escAttr(r.id)}" ${user?.rank_id === r.id ? 'selected' : ''}>${escHtml(r.rank_name)}</option>`).join('')}
+                  </select></div>` : ''}
+              </div>
+              ${!isEdit ? '<div class="notice notice-warning" style="margin-top:10px;">The new user signs in with this email and temporary password, then resets it via "Forgot password."</div>' : ''}
+              <div class="flex-between" style="margin-top:16px;">
+                <button class="btn btn-secondary" id="um-cancel">Cancel</button>
+                <button class="btn btn-primary" id="um-save">${isEdit ? 'Save' : 'Create User'}</button>
+              </div>
+            </div>
+          </div>`;
+
+        slot.querySelector('#um-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+        slot.querySelector('#um-save').addEventListener('click', async () => {
+          const name = slot.querySelector('#um-name').value.trim();
+          const role = slot.querySelector('#um-role').value;
+          const agencyId2 = isSuper ? (slot.querySelector('#um-agency')?.value || null) : profile.agency_id;
+          const rankId = slot.querySelector('#um-rank')?.value || null;
+          if (!name) { toast('Full name is required.', 'error'); return; }
+          if (role !== 'super_admin' && !agencyId2) { toast('Every non-super-admin user needs an agency.', 'error'); return; }
+          if (role === 'super_admin' && agencyId2) { toast('Super admins must have no agency (platform scope).', 'error'); return; }
+
+          const btn = slot.querySelector('#um-save');
+          btn.disabled = true;
+          try {
+            if (isEdit) {
+              const { error } = await supabase.from('profiles')
+                .update({ full_name: name, role, agency_id: agencyId2, rank_id: rankId }).eq('id', user.id);
+              if (error) throw error;
+              await logActivity(profile, 'user_update', 'profiles', user.id, { role, agency_id: agencyId2 });
+              toast('User updated.', 'success');
+            } else {
+              const email = slot.querySelector('#um-email').value.trim();
+              const pass = slot.querySelector('#um-pass').value;
+              if (!email) { toast('Email is required.', 'error'); btn.disabled = false; return; }
+              if (pass.length < 8) { toast('Temporary password must be at least 8 characters.', 'error'); btn.disabled = false; return; }
+              const { data: su, error: sErr } = await provisioningClient.auth.signUp({ email, password: pass });
+              if (sErr) throw sErr;
+              const uid = su.user?.id;
+              if (!uid) throw new Error('Auth account was not created — check Supabase auth settings.');
+              const { error: pErr } = await supabase.from('profiles').insert({
+                id: uid, agency_id: agencyId2, role, full_name: name, email, rank_id: rankId, is_active: true,
+              });
+              if (pErr) throw pErr;
+              await logActivity(profile, 'user_create', 'profiles', uid, { email, role, agency_id: agencyId2 });
+              toast(`User ${email} created.`, 'success');
+            }
+            slot.innerHTML = '';
+            renderUsers(body);
+          } catch (e) {
+            showError(e, isEdit ? 'Update user' : 'Create user');
+            btn.disabled = false;
+          }
+        });
+      }
+
+      draw();
+    }
+
+    // =====================================================================
+    // TAB: ACCESS REQUESTS
+    // =====================================================================
+    async function renderRequests(body) {
+      renderLoading(body, 'Loading access requests…');
+      let requests = [];
+      try {
+        let q = supabase.from('access_requests')
+          .select('id, agency_id, agency_name, full_name, email, requested_role, message, status, created_at, agency:agency_id (name)')
+          .order('created_at', { ascending: false });
+        if (!isSuper) q = q.eq('agency_id', profile.agency_id);
+        const { data, error } = await q;
+        if (error) throw error;
+        requests = data || [];
+      } catch (e) {
+        showError(e, 'Access requests'); renderErrorState(body); return;
+      }
+
+      const pending = requests.filter((r) => r.status === 'pending');
+
+      body.innerHTML = `
+        <div class="stat-grid">
+          <div class="stat ${pending.length ? 'warning' : ''}"><div class="stat-value">${pending.length}</div><div class="stat-label">Pending</div></div>
+          <div class="stat success"><div class="stat-value">${requests.filter((r) => r.status === 'approved').length}</div><div class="stat-label">Approved</div></div>
+          <div class="stat"><div class="stat-value">${requests.filter((r) => r.status === 'denied').length}</div><div class="stat-label">Denied</div></div>
+        </div>
+        <div class="card" style="margin-top:20px;">
+          <h3 class="card-title">Requests</h3>
+          <div id="req-table"></div>
+        </div>`;
+
+      const tbl = body.querySelector('#req-table');
+      if (!requests.length) {
+        renderEmpty(tbl, 'No access requests', 'New signup requests submitted from the login page will appear here.');
+        return;
+      }
+      tbl.innerHTML = `
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th>Requested</th><th>Name</th><th>Email</th><th>Agency</th><th>Role</th><th>Message</th><th>Status</th><th></th></tr></thead>
+          <tbody>${requests.map((r) => `
+            <tr>
+              <td>${fmtDateTime(r.created_at)}</td>
+              <td>${escHtml(r.full_name)}</td>
+              <td class="text-muted">${escHtml(r.email)}</td>
+              <td>${escHtml(r.agency?.name || r.agency_name || '—')}</td>
+              <td>${escHtml(r.requested_role ? (ROLE_LABEL[r.requested_role] || r.requested_role) : '—')}</td>
+              <td class="text-muted" style="max-width:220px;">${escHtml(r.message || '')}</td>
+              <td><span class="pill ${r.status === 'pending' ? 'pill-warning' : r.status === 'approved' ? 'pill-success' : 'pill-danger'}">${escHtml(r.status)}</span></td>
+              <td style="white-space:nowrap;">
+                ${r.status === 'pending' ? `
+                  <button class="btn btn-success btn-sm" data-approve="${escAttr(r.id)}">Approve</button>
+                  <button class="btn btn-danger btn-sm" data-deny="${escAttr(r.id)}">Deny</button>` : ''}
+              </td>
+            </tr>`).join('')}
+          </tbody></table></div>`;
+
+      tbl.querySelectorAll('[data-deny]').forEach((b) => {
+        b.addEventListener('click', async () => {
+          try {
+            const { error } = await supabase.from('access_requests')
+              .update({ status: 'denied', decided_by: profile.id, decided_at: new Date().toISOString() })
+              .eq('id', b.dataset.deny);
+            if (error) throw error;
+            await logActivity(profile, 'access_request_deny', 'access_requests', b.dataset.deny);
+            toast('Request denied.', 'success');
+            renderRequests(body);
+          } catch (e) { showError(e, 'Deny request'); }
+        });
+      });
+
+      tbl.querySelectorAll('[data-approve]').forEach((b) => {
+        b.addEventListener('click', () => openApproveModal(requests.find((r) => r.id === b.dataset.approve)));
+      });
+
+      // Approve = provision the auth account + profile in one flow.
+      function openApproveModal(req) {
+        const slot = document.getElementById('modal-slot');
+        slot.innerHTML = `
+          <div class="modal-backdrop">
+            <div class="modal">
+              <h3 class="card-title">Approve — ${escHtml(req.full_name)}</h3>
+              <div class="form-grid">
+                <div class="form-row">
+                  <div><label class="field-label">Role *</label>
+                    <select id="ap-role">
+                      ${ROLES.filter((r) => r !== 'super_admin').map((r) =>
+                        `<option value="${r}" ${req.requested_role === r ? 'selected' : ''}>${ROLE_LABEL[r]}</option>`).join('')}
+                    </select></div>
+                  ${isSuper ? `
+                  <div><label class="field-label">Agency *</label>
+                    <select id="ap-agency">
+                      ${agencies.map((a) => `<option value="${escAttr(a.id)}" ${req.agency_id === a.id ? 'selected' : ''}>${escHtml(a.name)}</option>`).join('')}
+                    </select></div>` : ''}
+                </div>
+                <div><label class="field-label">Temporary password *</label>
+                  <input id="ap-pass" type="text" placeholder="min 8 characters — share with the user securely" /></div>
+              </div>
+              <div class="flex-between" style="margin-top:16px;">
+                <button class="btn btn-secondary" id="ap-cancel">Cancel</button>
+                <button class="btn btn-success" id="ap-go">Approve & Create Account</button>
+              </div>
+            </div>
+          </div>`;
+        slot.querySelector('#ap-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+        slot.querySelector('#ap-go').addEventListener('click', async () => {
+          const role = slot.querySelector('#ap-role').value;
+          const agencyId2 = isSuper ? slot.querySelector('#ap-agency').value : profile.agency_id;
+          const pass = slot.querySelector('#ap-pass').value;
+          if (pass.length < 8) { toast('Temporary password must be at least 8 characters.', 'error'); return; }
+          const btn = slot.querySelector('#ap-go');
+          btn.disabled = true;
+          try {
+            const { data: su, error: sErr } = await provisioningClient.auth.signUp({ email: req.email, password: pass });
+            if (sErr) throw sErr;
+            const uid = su.user?.id;
+            if (!uid) throw new Error('Auth account was not created — the email may already be registered.');
+            const { error: pErr } = await supabase.from('profiles').insert({
+              id: uid, agency_id: agencyId2, role, full_name: req.full_name, email: req.email, is_active: true,
+            });
+            if (pErr) throw pErr;
+            const { error: uErr } = await supabase.from('access_requests')
+              .update({ status: 'approved', decided_by: profile.id, decided_at: new Date().toISOString() })
+              .eq('id', req.id);
+            if (uErr) throw uErr;
+            await logActivity(profile, 'access_request_approve', 'access_requests', req.id, { email: req.email, role });
+            toast(`${req.email} approved and account created.`, 'success');
+            slot.innerHTML = '';
+            renderRequests(body);
+          } catch (e) {
+            showError(e, 'Approve request');
+            btn.disabled = false;
+          }
+        });
+      }
+    }
+  </script>
+</body>
+</html>

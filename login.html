@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sign In · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="auth-shell">
+    <div class="auth-card">
+      <div class="auth-brand">
+        <div class="brand-mark">A</div>
+        <div>
+          <div class="auth-title">ATLAS</div>
+          <div class="auth-sub">Performance Management</div>
+        </div>
+      </div>
+      <div id="banner"></div>
+      <div class="form-row">
+        <label class="field-label" for="email">Email</label>
+        <input type="email" id="email" autocomplete="username" />
+      </div>
+      <div class="form-row">
+        <label class="field-label" for="password">Password</label>
+        <input type="password" id="password" autocomplete="current-password" />
+      </div>
+      <button class="btn btn-primary" id="signin-btn" style="width:100%;">Sign in</button>
+      <p style="text-align:center;margin:14px 0 0;font-size:13px;">
+        <a href="forgot-password.html">Forgot password?</a>
+        &nbsp;·&nbsp;
+        <a href="#" id="request-access-link">Request access</a>
+      </p>
+    </div>
+  </div>
+  <div id="modal-slot"></div>
+
+  <script type="module">
+    // ---- Login: profile is fetched separately from agency (split queries) so
+    // ---- super_admin's NULL agency and RLS edge cases never break sign-in.
+    import { supabase, logActivity } from './supabase-client.js';
+    import { escHtml, toast, showError } from './error-handler.js';
+
+    const params = new URLSearchParams(location.search);
+    const banner = document.getElementById('banner');
+    const err = params.get('err');
+    if (err === 'deactivated') {
+      banner.innerHTML = `<div class="notice notice-danger" style="margin-bottom:14px;">This account has been deactivated. Contact your agency administrator.</div>`;
+    } else if (err === 'no_profile') {
+      banner.innerHTML = `<div class="notice notice-warning" style="margin-bottom:14px;">Your sign-in succeeded but no ATLAS profile exists for this account yet. Ask your agency administrator to complete your setup, or submit an access request.</div>`;
+    }
+
+    const btn = document.getElementById('signin-btn');
+
+    async function signIn() {
+      const email = document.getElementById('email').value.trim();
+      const password = document.getElementById('password').value;
+      if (!email || !password) { toast('Enter your email and password.', 'error'); return; }
+      btn.disabled = true; btn.textContent = 'Signing in…';
+      try {
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+
+        // Split query 1: profile.
+        const { data: profile, error: pErr } = await supabase
+          .from('profiles').select('*').eq('id', data.user.id).maybeSingle();
+        if (pErr) throw pErr;
+        if (!profile) {
+          await supabase.auth.signOut();
+          location.href = 'login.html?err=no_profile';
+          return;
+        }
+        if (!profile.is_active) {
+          await supabase.auth.signOut();
+          location.href = 'login.html?err=deactivated';
+          return;
+        }
+        // Split query 2: agency — only if one exists (super_admin has none).
+        // (auth.js repeats this on the next page; the call here just validates.)
+        if (profile.agency_id) {
+          await supabase.from('agencies').select('id').eq('id', profile.agency_id).maybeSingle();
+        }
+
+        await logActivity(profile, 'sign_in');
+        const redirect = params.get('redirect');
+        location.href = redirect ? decodeURIComponent(redirect) : 'dashboard.html';
+      } catch (e) {
+        showError(e, 'Sign in failed');
+        btn.disabled = false; btn.textContent = 'Sign in';
+      }
+    }
+
+    btn.addEventListener('click', signIn);
+    document.getElementById('password').addEventListener('keydown', (e) => { if (e.key === 'Enter') signIn(); });
+
+    // ---- Request access (anonymous insert into access_requests) --------
+    document.getElementById('request-access-link').addEventListener('click', (e) => {
+      e.preventDefault();
+      const slot = document.getElementById('modal-slot');
+      slot.innerHTML = `
+        <div class="modal-backdrop">
+          <div class="modal">
+            <h3 class="card-title">Request Access</h3>
+            <p class="text-secondary mt-0">Submit your details and your agency administrator will review the request.</p>
+            <div class="form-grid">
+              <div><label class="field-label" for="ra-name">Full name *</label><input id="ra-name" /></div>
+              <div><label class="field-label" for="ra-email">Email *</label><input id="ra-email" type="email" /></div>
+              <div><label class="field-label" for="ra-agency">Agency name *</label><input id="ra-agency" placeholder="e.g. Anytown Police Department" /></div>
+              <div><label class="field-label" for="ra-msg">Message (role requested, rank, unit, etc.)</label><textarea id="ra-msg" rows="3"></textarea></div>
+            </div>
+            <div class="flex-between" style="margin-top:16px;">
+              <button class="btn btn-secondary" id="ra-cancel">Cancel</button>
+              <button class="btn btn-primary" id="ra-submit">Submit Request</button>
+            </div>
+          </div>
+        </div>`;
+      slot.querySelector('#ra-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+      slot.querySelector('#ra-submit').addEventListener('click', async () => {
+        const full_name = slot.querySelector('#ra-name').value.trim();
+        const email = slot.querySelector('#ra-email').value.trim();
+        const agency_name = slot.querySelector('#ra-agency').value.trim();
+        const message = slot.querySelector('#ra-msg').value.trim() || null;
+        if (!full_name || !email || !agency_name) { toast('Name, email, and agency are required.', 'error'); return; }
+        const sBtn = slot.querySelector('#ra-submit');
+        sBtn.disabled = true;
+        try {
+          const { error } = await supabase.from('access_requests')
+            .insert({ full_name, email, agency_name, message });
+          if (error) throw error;
+          slot.innerHTML = '';
+          toast('Access request submitted. An administrator will review it.', 'success');
+        } catch (e2) {
+          showError(e2, 'Request access');
+          sBtn.disabled = false;
+        }
+      });
+    });
+  </script>
+</body>
+</html>

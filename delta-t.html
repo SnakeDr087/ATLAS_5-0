@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Delta T · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase } from './supabase-client.js';
+    import { requireAgencyContext } from './agency-context.js';
+    import {
+      escHtml, escAttr, fmtDate, daysBetween, renderLoading, renderEmpty,
+      renderErrorState, showError,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('delta-t', 'Delta T — Intervention Tracking');
+    renderLoading(content, 'Loading intervention cases…');
+
+    const { agencyId } = await requireAgencyContext(profile, content);
+    if (agencyId) await init();
+
+    async function init() {
+      let rows = [];
+      try {
+        // Supervisors: RLS limits to own-roster officers automatically.
+        const { data, error } = await supabase.from('delta_t_cases')
+          .select(`id, status, t1_incident_date, t2_training_delivered, t4_verification_date, created_at,
+                   personnel_roster:officer_id (id, first_name, last_name, badge_number),
+                   kpi_definitions:kpi_id (kpi_text)`)
+          .eq('agency_id', agencyId).order('created_at', { ascending: false });
+        if (error) throw error;
+        rows = data || [];
+      } catch (e) {
+        showError(e, 'Delta T');
+        renderErrorState(content);
+        return;
+      }
+
+      const today = new Date().toISOString().slice(0, 10);
+      rows.forEach((r) => {
+        r._age = daysBetween(r.t1_incident_date, today) ?? 0;
+        r._flagged = r.status === 'open' && r._age >= 90;
+        r._t1t2 = daysBetween(r.t1_incident_date, r.t2_training_delivered);
+        r._t2t4 = daysBetween(r.t2_training_delivered, r.t4_verification_date);
+        r._total = daysBetween(r.t1_incident_date, r.t4_verification_date);
+      });
+
+      const open = rows.filter((r) => r.status === 'open');
+      const closed = rows.filter((r) => r.status === 'closed');
+      const flagged = rows.filter((r) => r._flagged);
+      const closedTotals = closed.map((r) => r._total).filter((v) => v !== null);
+      const avgDelta = closedTotals.length ? Math.round(closedTotals.reduce((a, b) => a + b, 0) / closedTotals.length) : null;
+
+      content.innerHTML = `
+        <div class="stat-grid">
+          <div class="stat warning"><div class="stat-value">${open.length}</div><div class="stat-label">Open cases</div></div>
+          <div class="stat danger"><div class="stat-value">${flagged.length}</div><div class="stat-label">Flagged 90+ days</div></div>
+          <div class="stat success"><div class="stat-value">${closed.length}</div><div class="stat-label">Closed / verified</div></div>
+          <div class="stat"><div class="stat-value">${avgDelta ?? '—'}</div><div class="stat-label">Avg Δ days (T1→T4, closed)</div></div>
+        </div>
+        <div class="card">
+          <div class="filter-bar">
+            <div style="flex:1;min-width:200px;"><label class="field-label">Officer</label><input type="text" id="f-q" placeholder="Name or badge…" /></div>
+            <div><label class="field-label">Status</label>
+              <select id="f-status"><option value="">All</option><option value="open">Open</option><option value="closed">Closed</option><option value="flagged">Flagged 90+</option></select>
+            </div>
+          </div>
+          <div class="table-wrap"><div id="table"></div></div>
+        </div>`;
+
+      const table = document.getElementById('table');
+      ['f-q', 'f-status'].forEach((id) => document.getElementById(id).addEventListener('input', paint));
+      paint();
+
+      function paint() {
+        const q = document.getElementById('f-q').value.trim().toLowerCase();
+        const st = document.getElementById('f-status').value;
+        const list = rows.filter((r) => {
+          if (q) {
+            const hay = `${r.personnel_roster?.first_name} ${r.personnel_roster?.last_name} ${r.personnel_roster?.badge_number}`.toLowerCase();
+            if (!hay.includes(q)) return false;
+          }
+          if (st === 'flagged') return r._flagged;
+          if (st && r.status !== st) return false;
+          return true;
+        });
+        if (!list.length) { renderEmpty(table, 'No intervention cases match', 'Delta T cases open automatically when a review outcome is Training.'); return; }
+        table.innerHTML = `
+          <table class="data">
+            <thead><tr><th>Officer</th><th>Deficient KPI</th><th>T1 observed</th><th>T2 trained</th><th>T4 verified</th><th>T1→T2</th><th>T2→T4</th><th>Status</th></tr></thead>
+            <tbody>${list.map((r) => `
+              <tr class="rowlink" data-id="${escAttr(r.id)}">
+                <td>${escHtml(r.personnel_roster?.last_name || '')}, ${escHtml(r.personnel_roster?.first_name || '')} <span class="text-muted">#${escHtml(r.personnel_roster?.badge_number || '')}</span></td>
+                <td style="max-width:320px;">${escHtml(r.kpi_definitions?.kpi_text || '—')}</td>
+                <td>${fmtDate(r.t1_incident_date)}</td>
+                <td>${fmtDate(r.t2_training_delivered)}</td>
+                <td>${fmtDate(r.t4_verification_date)}</td>
+                <td>${r._t1t2 !== null ? r._t1t2 + 'd' : '—'}</td>
+                <td>${r._t2t4 !== null ? r._t2t4 + 'd' : '—'}</td>
+                <td>${r._flagged ? '<span class="pill pill-danger">⚑ 90+ days</span>' : r.status === 'open' ? '<span class="pill pill-warning">open</span>' : '<span class="pill pill-success">closed</span>'}</td>
+              </tr>`).join('')}</tbody>
+          </table>`;
+        table.querySelectorAll('.rowlink').forEach((tr) =>
+          tr.addEventListener('click', () => (location.href = `delta-t-detail.html?id=${tr.dataset.id}`)));
+      }
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Reports · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase } from './supabase-client.js';
+    import { requireAgencyContext } from './agency-context.js';
+    import {
+      escHtml, escAttr, fmtDate, renderLoading, renderEmpty, renderErrorState,
+      showError, scoreClass, outcomeBadge, outcomeLabel, daysBetween,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('reports', 'Reports & Analytics');
+    renderLoading(content, 'Loading analytics…');
+
+    const { agencyId, agency } = await requireAgencyContext(profile, content);
+    if (agencyId) await init();
+
+    async function init() {
+      const threshold = Number(agency?.min_performance_threshold ?? 80);
+
+      // Default range: last 12 months
+      const today = new Date();
+      const defEnd = today.toISOString().slice(0, 10);
+      const defStart = new Date(today.getFullYear() - 1, today.getMonth(), 1).toISOString().slice(0, 10);
+
+      content.innerHTML = `
+        <div class="card">
+          <div class="filter-bar">
+            <div>
+              <label class="field-label" for="f-start">From</label>
+              <input type="date" id="f-start" value="${escAttr(defStart)}" />
+            </div>
+            <div>
+              <label class="field-label" for="f-end">To</label>
+              <input type="date" id="f-end" value="${escAttr(defEnd)}" />
+            </div>
+            <button class="btn btn-primary" id="btn-apply" style="align-self:flex-end;">Apply Range</button>
+          </div>
+        </div>
+        <div id="report-body" style="margin-top:20px;"></div>
+      `;
+
+      const body = document.getElementById('report-body');
+      document.getElementById('btn-apply').addEventListener('click', () => load());
+      await load();
+
+      async function load() {
+        const start = document.getElementById('f-start').value;
+        const end = document.getElementById('f-end').value;
+        renderLoading(body, 'Crunching numbers…');
+
+        let reviews, deltaTs, assignments;
+        try {
+          const rQ = supabase.from('bwc_reviews')
+            .select('id, review_date, kpi_score, follow_up_outcome, incident_type:incident_type_id (name)')
+            .eq('agency_id', agencyId).order('review_date', { ascending: true });
+          if (start) rQ.gte('review_date', start);
+          if (end) rQ.lte('review_date', end);
+
+          const [rRes, dRes, aRes] = await Promise.all([
+            rQ,
+            supabase.from('delta_t_cases')
+              .select(`id, status, t1_incident_date, t2_training_delivered, t4_verification_date,
+                       officer:officer_id (first_name, last_name, badge_number),
+                       kpi:kpi_id (kpi_text)`)
+              .eq('agency_id', agencyId).order('t1_incident_date', { ascending: false }),
+            supabase.from('training_assignments')
+              .select(`id, course, assigned_date, date_delivered,
+                       officer:officer_id (first_name, last_name, badge_number)`)
+              .eq('agency_id', agencyId).order('assigned_date', { ascending: false }),
+          ]);
+          if (rRes.error) throw rRes.error;
+          if (dRes.error) throw dRes.error;
+          if (aRes.error) throw aRes.error;
+          reviews = rRes.data || [];
+          deltaTs = dRes.data || [];
+          assignments = aRes.data || [];
+        } catch (e) {
+          showError(e, 'Reports');
+          renderErrorState(body);
+          return;
+        }
+
+        // ---- Aggregations ------------------------------------------------
+        const scored = reviews.filter((r) => r.kpi_score !== null);
+        const avgScore = scored.length
+          ? scored.reduce((a, r) => a + Number(r.kpi_score), 0) / scored.length : null;
+
+        // Reviews per month
+        const byMonth = {};
+        reviews.forEach((r) => {
+          const k = (r.review_date || '').slice(0, 7);
+          if (k) byMonth[k] = (byMonth[k] || 0) + 1;
+        });
+        const months = Object.keys(byMonth).sort();
+
+        // Outcome distribution
+        const outcomes = {};
+        reviews.forEach((r) => { const k = r.follow_up_outcome || 'no_action'; outcomes[k] = (outcomes[k] || 0) + 1; });
+
+        // Delta T intervals (closed/verified cases only)
+        const closed = deltaTs.filter((d) => d.status === 'closed' && d.t4_verification_date);
+        const t12 = closed.map((d) => daysBetween(d.t1_incident_date, d.t2_training_delivered)).filter((v) => v !== null);
+        const t24 = closed.map((d) => daysBetween(d.t2_training_delivered, d.t4_verification_date)).filter((v) => v !== null);
+        const avg = (arr) => arr.length ? (arr.reduce((a, b) => a + b, 0) / arr.length) : null;
+        const openDT = deltaTs.filter((d) => d.status === 'open');
+        const flagged = openDT.filter((d) => {
+          const days = daysBetween(d.t1_incident_date, new Date().toISOString());
+          return days !== null && days >= 90;
+        });
+
+        // ---- Render --------------------------------------------------------
+        body.innerHTML = `
+          <div class="stat-grid">
+            <div class="stat"><div class="stat-value">${reviews.length}</div><div class="stat-label">Reviews in Range</div></div>
+            <div class="stat ${avgScore !== null && avgScore < threshold ? 'danger' : 'success'}">
+              <div class="stat-value">${avgScore === null ? '—' : avgScore.toFixed(1) + '%'}</div>
+              <div class="stat-label">Avg KPI Score</div>
+            </div>
+            <div class="stat ${flagged.length ? 'danger' : ''}"><div class="stat-value">${openDT.length}</div><div class="stat-label">Open Delta T (${flagged.length} flagged)</div></div>
+            <div class="stat"><div class="stat-value">${avg(t12) === null ? '—' : avg(t12).toFixed(0) + 'd'}</div><div class="stat-label">Avg T1→T2 (response lag)</div></div>
+            <div class="stat"><div class="stat-value">${avg(t24) === null ? '—' : avg(t24).toFixed(0) + 'd'}</div><div class="stat-label">Avg T2→T4 (correction lag)</div></div>
+          </div>
+
+          <div style="display:grid; grid-template-columns: 3fr 2fr; gap:20px; margin-top:20px;">
+            <div class="card">
+              <h3 class="card-title">Review Volume by Month</h3>
+              ${months.length ? columnsSVG(months, byMonth) : '<p class="text-muted">No reviews in this range.</p>'}
+            </div>
+            <div class="card">
+              <h3 class="card-title">Outcome Distribution</h3>
+              ${reviews.length ? barsHTML(outcomes, reviews.length) : '<p class="text-muted">No reviews in this range.</p>'}
+            </div>
+          </div>
+
+          <div class="card" style="margin-top:20px;">
+            <div class="flex-between">
+              <h3 class="card-title mb-0">Delta T Cases (all)</h3>
+              <span class="text-muted">${deltaTs.length} case${deltaTs.length === 1 ? '' : 's'} · ${closed.length} verified closed</span>
+            </div>
+            <div id="dt-table" style="margin-top:12px;"></div>
+          </div>
+
+          <div class="card" style="margin-top:20px;">
+            <div class="flex-between">
+              <h3 class="card-title mb-0">Training Assignments (all)</h3>
+              <span class="text-muted">${assignments.length} record${assignments.length === 1 ? '' : 's'}</span>
+            </div>
+            <div id="ta-table" style="margin-top:12px;"></div>
+          </div>
+        `;
+
+        // Delta T table
+        const dtEl = document.getElementById('dt-table');
+        if (!deltaTs.length) {
+          renderEmpty(dtEl, 'No Delta T cases', 'No intervention cases exist for this agency.');
+        } else {
+          dtEl.innerHTML = `
+            <div class="table-wrap"><table class="data">
+              <thead><tr><th>Officer</th><th>KPI</th><th>Status</th><th>T1</th><th>T2</th><th>T4</th><th>T1→T2</th><th>T2→T4</th></tr></thead>
+              <tbody>${deltaTs.map((d) => {
+                const a = daysBetween(d.t1_incident_date, d.t2_training_delivered);
+                const b = daysBetween(d.t2_training_delivered, d.t4_verification_date);
+                const openDays = d.status === 'open' ? daysBetween(d.t1_incident_date, new Date().toISOString()) : null;
+                const isFlagged = openDays !== null && openDays >= 90;
+                return `
+                <tr class="rowlink" data-id="${escAttr(d.id)}">
+                  <td>${escHtml(d.officer ? `${d.officer.last_name}, ${d.officer.first_name}` : '—')} <span class="text-muted">#${escHtml(d.officer?.badge_number || '')}</span></td>
+                  <td>${escHtml(d.kpi?.kpi_text || '—')}</td>
+                  <td><span class="pill ${d.status === 'open' ? (isFlagged ? 'pill-danger' : 'pill-warning') : 'pill-success'}">${isFlagged ? 'flagged 90+' : escHtml(d.status)}</span></td>
+                  <td>${fmtDate(d.t1_incident_date)}</td>
+                  <td>${d.t2_training_delivered ? fmtDate(d.t2_training_delivered) : '—'}</td>
+                  <td>${d.t4_verification_date ? fmtDate(d.t4_verification_date) : '—'}</td>
+                  <td>${a === null ? '—' : a + 'd'}</td>
+                  <td>${b === null ? '—' : b + 'd'}</td>
+                </tr>`;
+              }).join('')}
+              </tbody></table></div>`;
+          dtEl.querySelectorAll('tr.rowlink').forEach((tr) => {
+            tr.addEventListener('click', () => {
+              location.href = `delta-t-detail.html?id=${encodeURIComponent(tr.dataset.id)}${suffix()}`;
+            });
+          });
+        }
+
+        // Assignments table
+        const taEl = document.getElementById('ta-table');
+        if (!assignments.length) {
+          renderEmpty(taEl, 'No training assignments', 'No courses have been assigned yet.');
+        } else {
+          taEl.innerHTML = `
+            <div class="table-wrap"><table class="data">
+              <thead><tr><th>Officer</th><th>Course</th><th>Assigned</th><th>Delivered</th></tr></thead>
+              <tbody>${assignments.map((a) => `
+                <tr>
+                  <td>${escHtml(a.officer ? `${a.officer.last_name}, ${a.officer.first_name}` : '—')} <span class="text-muted">#${escHtml(a.officer?.badge_number || '')}</span></td>
+                  <td>${escHtml(a.course || '—')}</td>
+                  <td>${fmtDate(a.assigned_date)}</td>
+                  <td>${a.date_delivered ? `<span class="pill pill-success">${fmtDate(a.date_delivered)}</span>` : '<span class="pill pill-warning">pending</span>'}</td>
+                </tr>`).join('')}
+              </tbody></table></div>`;
+        }
+      }
+    }
+
+    function suffix() {
+      const a = new URLSearchParams(location.search).get('agency_id');
+      return a && profile.role === 'super_admin' ? `&agency_id=${encodeURIComponent(a)}` : '';
+    }
+
+    // ---- Inline SVG monthly column chart --------------------------------
+    function columnsSVG(months, byMonth) {
+      const w = 640, h = 180, padL = 8, padB = 26, padT = 14;
+      const max = Math.max(...months.map((m) => byMonth[m]), 1);
+      const bw = Math.min(46, (w - padL * 2) / months.length - 8);
+      const step = (w - padL * 2) / months.length;
+      return `
+        <svg viewBox="0 0 ${w} ${h}" style="width:100%; height:auto;" role="img" aria-label="Reviews per month">
+          ${months.map((m, i) => {
+            const val = byMonth[m];
+            const bh = ((h - padB - padT) * val) / max;
+            const x = padL + i * step + (step - bw) / 2;
+            const y = h - padB - bh;
+            const label = m.slice(5) + '/' + m.slice(2, 4);
+            return `
+              <rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}"
+                rx="4" fill="var(--accent)"><title>${escHtml(m)}: ${val}</title></rect>
+              <text x="${(x + bw / 2).toFixed(1)}" y="${(y - 4).toFixed(1)}" text-anchor="middle" font-size="11" fill="var(--text-secondary)">${val}</text>
+              <text x="${(x + bw / 2).toFixed(1)}" y="${h - 8}" text-anchor="middle" font-size="10" fill="var(--text-muted)">${escHtml(label)}</text>`;
+          }).join('')}
+        </svg>`;
+    }
+
+    // ---- Horizontal outcome distribution bars ---------------------------
+    function barsHTML(outcomes, total) {
+      const order = ['no_action', 'commendation', 'coaching', 'training', 'internal_affairs', 'pip'];
+      const colors = {
+        no_action: 'var(--text-muted)', commendation: 'var(--success)', coaching: 'var(--accent)',
+        training: 'var(--warning)', internal_affairs: 'var(--danger)', pip: 'var(--danger)',
+      };
+      return order.filter((k) => outcomes[k]).map((k) => {
+        const n = outcomes[k];
+        const pct = ((n / total) * 100).toFixed(0);
+        return `
+          <div style="margin-bottom:10px;">
+            <div class="flex-between" style="font-size:13px; margin-bottom:3px;">
+              <span>${escHtml(outcomeLabel(k))}</span><span class="text-muted">${n} (${pct}%)</span>
+            </div>
+            <div style="background:var(--bg-elevated); border-radius:6px; height:10px; overflow:hidden;">
+              <div style="width:${pct}%; height:100%; background:${colors[k]}; border-radius:6px;"></div>
+            </div>
+          </div>`;
+      }).join('');
+    }
+  </script>
+</body>
+</html>

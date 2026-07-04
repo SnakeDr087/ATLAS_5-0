@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Roster · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase, logActivity } from './supabase-client.js';
+    import { requireAgencyContext } from './agency-context.js';
+    import { OfficerSearch } from './officer-search.js';
+    import {
+      escHtml, escAttr, renderLoading, renderEmpty, renderErrorState,
+      showError, toast, scoreClass,
+    } from './error-handler.js';
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('roster', 'Roster');
+    renderLoading(content, 'Loading roster…');
+
+    const { agencyId, agency } = await requireAgencyContext(profile, content);
+    if (agencyId) {
+      if (profile.role === 'supervisor') await supervisorView();
+      else await adminView();
+    }
+
+    // =====================================================================
+    // SUPERVISOR VARIANT — build "my roster" via supervisor_rosters
+    // =====================================================================
+    async function supervisorView() {
+      const threshold = Number(agency?.min_performance_threshold ?? 80);
+
+      async function load() {
+        renderLoading(content, 'Loading your roster…');
+        let rows;
+        try {
+          const { data, error } = await supabase.from('supervisor_rosters')
+            .select(`id, officer:officer_id (id, first_name, last_name, badge_number, email,
+                     performance_score, officer_status, rank:rank_id (rank_name))`)
+            .eq('supervisor_id', profile.id);
+          if (error) throw error;
+          rows = (data || []).filter((r) => r.officer)
+            .sort((a, b) => (a.officer.last_name || '').localeCompare(b.officer.last_name || ''));
+        } catch (e) {
+          showError(e, 'My roster'); renderErrorState(content); return;
+        }
+
+        const active = rows.filter((r) => r.officer.officer_status === 'active');
+        const below = active.filter((r) => r.officer.performance_score !== null && Number(r.officer.performance_score) < threshold);
+
+        content.innerHTML = `
+          <div class="stat-grid">
+            <div class="stat"><div class="stat-value">${rows.length}</div><div class="stat-label">On My Roster</div></div>
+            <div class="stat success"><div class="stat-value">${active.length}</div><div class="stat-label">Active</div></div>
+            <div class="stat ${below.length ? 'danger' : ''}"><div class="stat-value">${below.length}</div><div class="stat-label">Below ${threshold}% Floor</div></div>
+          </div>
+
+          <div class="card" style="margin-top:20px;">
+            <h3 class="card-title">Add an officer to my roster</h3>
+            <p class="text-secondary mt-0">Search the agency roster and attach officers you supervise. Reviews, Auto Select, and Delta T visibility follow this list.</p>
+            <div id="attach-search" style="max-width:480px;"></div>
+          </div>
+
+          <div class="card" style="margin-top:20px;">
+            <div class="flex-between">
+              <h3 class="card-title mb-0">My Roster</h3>
+              <span class="text-muted">${rows.length} officer${rows.length === 1 ? '' : 's'}</span>
+            </div>
+            <div id="roster-table" style="margin-top:12px;"></div>
+          </div>
+        `;
+
+        // Attach search — agency-wide scope (supervisorId omitted on purpose).
+        new OfficerSearch(document.getElementById('attach-search'), {
+          agencyId,
+          placeholder: 'Search agency roster by name or badge…',
+          onSelect: async (officer) => {
+            if (!officer) return; // cleared
+            if (rows.some((r) => r.officer.id === officer.id)) {
+              toast('Officer is already on your roster.', 'error'); return;
+            }
+            try {
+              const { error } = await supabase.from('supervisor_rosters')
+                .insert({ supervisor_id: profile.id, officer_id: officer.id });
+              if (error) throw error;
+              await logActivity(profile, 'roster_attach', 'personnel_roster', officer.id,
+                { officer: `${officer.last_name}, ${officer.first_name}` });
+              toast(`${officer.last_name}, ${officer.first_name} added to your roster.`, 'success');
+              load();
+            } catch (e) { showError(e, 'Attach officer'); }
+          },
+        });
+
+        const tbl = document.getElementById('roster-table');
+        if (!rows.length) {
+          renderEmpty(tbl, 'Your roster is empty', 'Use the search above to attach the officers you supervise.');
+          return;
+        }
+        tbl.innerHTML = `
+          <div class="table-wrap"><table class="data">
+            <thead><tr><th>Badge</th><th>Name</th><th>Rank</th><th>Score</th><th>Status</th><th></th></tr></thead>
+            <tbody>${rows.map((r) => {
+              const o = r.officer;
+              return `
+              <tr>
+                <td>${escHtml(o.badge_number || '—')}</td>
+                <td><a href="officer-profile.html?officer_id=${encodeURIComponent(o.id)}${suffix()}">${escHtml(o.last_name)}, ${escHtml(o.first_name)}</a></td>
+                <td>${escHtml(o.rank?.rank_name || '—')}</td>
+                <td>${o.performance_score === null ? '—' : `<span class="${scoreClass(o.performance_score, threshold)}">${Number(o.performance_score).toFixed(1)}%</span>`}</td>
+                <td>${statusPill(o.officer_status)}</td>
+                <td><button class="btn btn-secondary btn-sm" data-detach="${escAttr(r.id)}" data-name="${escAttr(`${o.last_name}, ${o.first_name}`)}" data-oid="${escAttr(o.id)}">Detach</button></td>
+              </tr>`;
+            }).join('')}
+            </tbody></table></div>`;
+
+        tbl.querySelectorAll('[data-detach]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            if (!confirm(`Remove ${btn.dataset.name} from your roster?`)) return;
+            try {
+              const { error } = await supabase.from('supervisor_rosters')
+                .delete().eq('id', btn.dataset.detach);
+              if (error) throw error;
+              await logActivity(profile, 'roster_detach', 'personnel_roster', btn.dataset.oid,
+                { officer: btn.dataset.name });
+              toast('Officer detached.', 'success');
+              load();
+            } catch (e) { showError(e, 'Detach officer'); }
+          });
+        });
+      }
+
+      await load();
+    }
+
+    // =====================================================================
+    // ADMIN VARIANT — full officer management (super_admin / agency_admin)
+    // =====================================================================
+    async function adminView() {
+      const threshold = Number(agency?.min_performance_threshold ?? 80);
+      let ranks = [];
+      let officers = [];
+      let statusFilter = 'all';
+      let search = '';
+
+      async function loadData() {
+        const [rRes, oRes] = await Promise.all([
+          supabase.from('agency_ranks').select('id, rank_name, rank_order')
+            .eq('agency_id', agencyId).eq('is_active', true).order('rank_order'),
+          supabase.from('personnel_roster')
+            .select('id, first_name, last_name, badge_number, email, performance_score, officer_status, rank_id, rank:rank_id (rank_name)')
+            .eq('agency_id', agencyId)
+            .order('last_name'),
+        ]);
+        if (rRes.error) throw rRes.error;
+        if (oRes.error) throw oRes.error;
+        ranks = rRes.data || [];
+        officers = oRes.data || [];
+      }
+
+      async function refresh() {
+        renderLoading(content, 'Loading roster…');
+        try { await loadData(); } catch (e) {
+          showError(e, 'Roster'); renderErrorState(content); return;
+        }
+        renderPage();
+      }
+
+      function filtered() {
+        return officers.filter((o) => {
+          if (statusFilter !== 'all' && o.officer_status !== statusFilter) return false;
+          if (search) {
+            const t = `${o.first_name} ${o.last_name} ${o.badge_number || ''}`.toLowerCase();
+            if (!t.includes(search.toLowerCase())) return false;
+          }
+          return true;
+        });
+      }
+
+      function renderPage() {
+        const active = officers.filter((o) => o.officer_status === 'active');
+        const below = active.filter((o) => o.performance_score !== null && Number(o.performance_score) < threshold);
+
+        content.innerHTML = `
+          <div class="stat-grid">
+            <div class="stat"><div class="stat-value">${officers.length}</div><div class="stat-label">Total Officers</div></div>
+            <div class="stat success"><div class="stat-value">${active.length}</div><div class="stat-label">Active</div></div>
+            <div class="stat ${below.length ? 'danger' : ''}"><div class="stat-value">${below.length}</div><div class="stat-label">Below ${threshold}% Floor</div></div>
+            <div class="stat"><div class="stat-value">${officers.filter((o) => o.officer_status === 'on_leave').length}</div><div class="stat-label">On Leave</div></div>
+          </div>
+
+          <div class="card" style="margin-top:20px;">
+            <div class="filter-bar">
+              <input type="search" id="f-search" placeholder="Search name or badge…" value="${escAttr(search)}" style="min-width:220px;" />
+              <select id="f-status">
+                <option value="all">All statuses</option>
+                <option value="active">Active</option>
+                <option value="on_leave">On Leave</option>
+                <option value="inactive">Inactive</option>
+                <option value="terminated">Terminated</option>
+              </select>
+              <div style="flex:1;"></div>
+              <button class="btn btn-secondary" id="btn-csv">Bulk CSV Upload</button>
+              <button class="btn btn-primary" id="btn-add">Add Officer</button>
+            </div>
+            <div id="roster-table" style="margin-top:12px;"></div>
+          </div>
+          <div id="modal-slot"></div>
+        `;
+
+        document.getElementById('f-status').value = statusFilter;
+        document.getElementById('f-search').addEventListener('input', (e) => { search = e.target.value; renderTable(); });
+        document.getElementById('f-status').addEventListener('change', (e) => { statusFilter = e.target.value; renderTable(); });
+        document.getElementById('btn-add').addEventListener('click', () => openEditModal(null));
+        document.getElementById('btn-csv').addEventListener('click', openCsvModal);
+        renderTable();
+      }
+
+      function renderTable() {
+        const rows = filtered();
+        const el = document.getElementById('roster-table');
+        if (!rows.length) {
+          renderEmpty(el, 'No officers match', officers.length ? 'Adjust the filters above.' : 'Add your first officer or use bulk CSV upload.');
+          return;
+        }
+        el.innerHTML = `
+          <div class="table-wrap"><table class="data">
+            <thead><tr><th>Badge</th><th>Name</th><th>Rank</th><th>Score</th><th>Status</th><th>Email</th><th></th></tr></thead>
+            <tbody>${rows.map((o) => `
+              <tr>
+                <td>${escHtml(o.badge_number || '—')}</td>
+                <td><a href="officer-profile.html?officer_id=${encodeURIComponent(o.id)}${suffix()}">${escHtml(o.last_name)}, ${escHtml(o.first_name)}</a></td>
+                <td>${escHtml(o.rank?.rank_name || '—')}</td>
+                <td>${o.performance_score === null ? '—' : `<span class="${scoreClass(o.performance_score, threshold)}">${Number(o.performance_score).toFixed(1)}%</span>`}</td>
+                <td>${statusPill(o.officer_status)}</td>
+                <td class="text-muted">${escHtml(o.email || '—')}</td>
+                <td style="white-space:nowrap;">
+                  <button class="btn btn-secondary btn-sm" data-edit="${escAttr(o.id)}">Edit</button>
+                  ${o.officer_status === 'active'
+                    ? `<button class="btn btn-danger btn-sm" data-deactivate="${escAttr(o.id)}" data-name="${escAttr(`${o.last_name}, ${o.first_name}`)}">Deactivate</button>`
+                    : ''}
+                </td>
+              </tr>`).join('')}
+            </tbody></table></div>`;
+
+        el.querySelectorAll('[data-edit]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            openEditModal(officers.find((o) => o.id === btn.dataset.edit));
+          });
+        });
+        el.querySelectorAll('[data-deactivate]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            if (!confirm(`Set ${btn.dataset.name} to inactive?`)) return;
+            try {
+              const { error } = await supabase.from('personnel_roster')
+                .update({ officer_status: 'inactive' }).eq('id', btn.dataset.deactivate);
+              if (error) throw error;
+              await logActivity(profile, 'officer_deactivate', 'personnel_roster', btn.dataset.deactivate,
+                { officer: btn.dataset.name });
+              toast('Officer deactivated.', 'success');
+              refresh();
+            } catch (e) { showError(e, 'Deactivate officer'); }
+          });
+        });
+      }
+
+      // ---- Add / Edit modal ---------------------------------------------
+      function openEditModal(officer) {
+        const isEdit = !!officer;
+        const slot = document.getElementById('modal-slot');
+        slot.innerHTML = `
+          <div class="modal-backdrop">
+            <div class="modal">
+              <h3 class="card-title">${isEdit ? 'Edit Officer' : 'Add Officer'}</h3>
+              <div class="form-grid">
+                <div class="form-row">
+                  <div><label class="field-label" for="m-first">First name *</label>
+                    <input id="m-first" value="${escAttr(officer?.first_name || '')}" /></div>
+                  <div><label class="field-label" for="m-last">Last name *</label>
+                    <input id="m-last" value="${escAttr(officer?.last_name || '')}" /></div>
+                </div>
+                <div class="form-row">
+                  <div><label class="field-label" for="m-badge">Badge number</label>
+                    <input id="m-badge" value="${escAttr(officer?.badge_number || '')}" /></div>
+                  <div><label class="field-label" for="m-email">Email</label>
+                    <input id="m-email" type="email" value="${escAttr(officer?.email || '')}" /></div>
+                </div>
+                <div class="form-row">
+                  <div><label class="field-label" for="m-rank">Rank</label>
+                    <select id="m-rank">
+                      <option value="">— Unranked —</option>
+                      ${ranks.map((r) => `<option value="${escAttr(r.id)}" ${officer?.rank_id === r.id ? 'selected' : ''}>${escHtml(r.rank_name)}</option>`).join('')}
+                    </select></div>
+                  <div><label class="field-label" for="m-status">Status</label>
+                    <select id="m-status">
+                      ${['active', 'on_leave', 'inactive', 'terminated'].map((s) =>
+                        `<option value="${s}" ${(officer?.officer_status || 'active') === s ? 'selected' : ''}>${s.replace('_', ' ')}</option>`).join('')}
+                    </select></div>
+                </div>
+              </div>
+              <div class="flex-between" style="margin-top:16px;">
+                <button class="btn btn-secondary" id="m-cancel">Cancel</button>
+                <button class="btn btn-primary" id="m-save">${isEdit ? 'Save Changes' : 'Add Officer'}</button>
+              </div>
+            </div>
+          </div>`;
+
+        slot.querySelector('#m-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+        slot.querySelector('#m-save').addEventListener('click', async () => {
+          const payload = {
+            first_name: slot.querySelector('#m-first').value.trim(),
+            last_name: slot.querySelector('#m-last').value.trim(),
+            badge_number: slot.querySelector('#m-badge').value.trim() || null,
+            email: slot.querySelector('#m-email').value.trim() || null,
+            rank_id: slot.querySelector('#m-rank').value || null,
+            officer_status: slot.querySelector('#m-status').value,
+          };
+          if (!payload.first_name || !payload.last_name) {
+            toast('First and last name are required.', 'error'); return;
+          }
+          try {
+            if (isEdit) {
+              const { error } = await supabase.from('personnel_roster')
+                .update(payload).eq('id', officer.id);
+              if (error) throw error;
+              await logActivity(profile, 'officer_update', 'personnel_roster', officer.id, payload);
+              toast('Officer updated.', 'success');
+            } else {
+              const { data, error } = await supabase.from('personnel_roster')
+                .insert({ ...payload, agency_id: agencyId }).select('id').single();
+              if (error) throw error;
+              await logActivity(profile, 'officer_add', 'personnel_roster', data.id, payload);
+              toast('Officer added.', 'success');
+            }
+            slot.innerHTML = '';
+            refresh();
+          } catch (e) { showError(e, isEdit ? 'Update officer' : 'Add officer'); }
+        });
+      }
+
+      // ---- CSV bulk upload modal ------------------------------------------
+      function openCsvModal() {
+        const slot = document.getElementById('modal-slot');
+        slot.innerHTML = `
+          <div class="modal-backdrop">
+            <div class="modal" style="max-width:640px;">
+              <h3 class="card-title">Bulk CSV Upload</h3>
+              <p class="text-secondary mt-0">
+                Header row required: <code>first_name,last_name,badge_number,email,rank_name,status</code>.
+                <br/>rank_name must match an existing rank exactly (or be blank). status defaults to active.
+              </p>
+              <input type="file" id="csv-file" accept=".csv,text/csv" />
+              <div id="csv-preview" style="margin-top:12px;"></div>
+              <div class="flex-between" style="margin-top:16px;">
+                <button class="btn btn-secondary" id="csv-cancel">Cancel</button>
+                <button class="btn btn-primary" id="csv-import" disabled>Import</button>
+              </div>
+            </div>
+          </div>`;
+
+        let parsed = [];
+        const preview = slot.querySelector('#csv-preview');
+        const importBtn = slot.querySelector('#csv-import');
+
+        slot.querySelector('#csv-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+
+        slot.querySelector('#csv-file').addEventListener('change', async (e) => {
+          const file = e.target.files[0];
+          if (!file) return;
+          const text = await file.text();
+          const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+          if (lines.length < 2) {
+            preview.innerHTML = '<div class="notice notice-danger">CSV needs a header row plus at least one data row.</div>';
+            importBtn.disabled = true; return;
+          }
+          const header = splitCsvLine(lines[0]).map((h) => h.trim().toLowerCase());
+          const idx = (name) => header.indexOf(name);
+          if (idx('first_name') === -1 || idx('last_name') === -1) {
+            preview.innerHTML = '<div class="notice notice-danger">Header must include first_name and last_name.</div>';
+            importBtn.disabled = true; return;
+          }
+          const rankByName = Object.fromEntries(ranks.map((r) => [r.rank_name.toLowerCase(), r.id]));
+          const validStatus = ['active', 'on_leave', 'inactive', 'terminated'];
+          const problems = [];
+          parsed = lines.slice(1).map((line, i) => {
+            const cells = splitCsvLine(line);
+            const get = (name) => idx(name) === -1 ? '' : (cells[idx(name)] || '').trim();
+            const rankName = get('rank_name');
+            const rank_id = rankName ? (rankByName[rankName.toLowerCase()] || null) : null;
+            if (rankName && !rank_id) problems.push(`Row ${i + 2}: unknown rank "${rankName}" — will import unranked.`);
+            let status = get('status').toLowerCase() || 'active';
+            if (!validStatus.includes(status)) { problems.push(`Row ${i + 2}: invalid status "${status}" — using active.`); status = 'active'; }
+            return {
+              agency_id: agencyId,
+              first_name: get('first_name'),
+              last_name: get('last_name'),
+              badge_number: get('badge_number') || null,
+              email: get('email') || null,
+              rank_id,
+              officer_status: status,
+            };
+          }).filter((r) => r.first_name && r.last_name);
+
+          preview.innerHTML = `
+            <div class="notice">${parsed.length} valid row${parsed.length === 1 ? '' : 's'} ready to import.</div>
+            ${problems.length ? `<div class="notice notice-warning" style="margin-top:8px;">${problems.map(escHtml).join('<br/>')}</div>` : ''}`;
+          importBtn.disabled = parsed.length === 0;
+        });
+
+        importBtn.addEventListener('click', async () => {
+          importBtn.disabled = true;
+          try {
+            const { error } = await supabase.from('personnel_roster').insert(parsed);
+            if (error) throw error;
+            await logActivity(profile, 'officer_bulk_import', 'personnel_roster', null, { count: parsed.length });
+            toast(`Imported ${parsed.length} officers.`, 'success');
+            slot.innerHTML = '';
+            refresh();
+          } catch (e) {
+            showError(e, 'CSV import');
+            importBtn.disabled = false;
+          }
+        });
+      }
+
+      await refresh();
+    }
+
+    // ---- Shared bits -----------------------------------------------------
+    function statusPill(s) {
+      const cls = {
+        active: 'pill pill-success', on_leave: 'pill pill-warning',
+        inactive: 'pill', terminated: 'pill pill-danger',
+      }[s] || 'pill';
+      return `<span class="${cls}">${escHtml((s || '').replace('_', ' '))}</span>`;
+    }
+
+    function suffix() {
+      const a = new URLSearchParams(location.search).get('agency_id');
+      return a && profile.role === 'super_admin' ? `&agency_id=${encodeURIComponent(a)}` : '';
+    }
+
+    // Minimal CSV field splitter (handles quoted fields with commas).
+    function splitCsvLine(line) {
+      const out = []; let cur = ''; let inQ = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (inQ) {
+          if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+          else if (ch === '"') inQ = false;
+          else cur += ch;
+        } else if (ch === '"') inQ = true;
+        else if (ch === ',') { out.push(cur); cur = ''; }
+        else cur += ch;
+      }
+      out.push(cur);
+      return out;
+    }
+  </script>
+</body>
+</html>

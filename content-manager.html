@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Content Manager · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside id="sidebar"></aside>
+    <div class="main">
+      <header id="topbar"></header>
+      <main id="content" class="content"></main>
+    </div>
+  </div>
+
+  <script type="module">
+    import { bootPage } from './auth.js';
+    import { supabase, logActivity } from './supabase-client.js';
+    import { requireAgencyContext } from './agency-context.js';
+    import {
+      escHtml, escAttr, renderLoading, renderEmpty, renderErrorState,
+      showError, toast,
+    } from './error-handler.js';
+
+    // The four content types share one baseline+suppression model:
+    //   super_admin edits the GLOBAL baseline (agency_id NULL).
+    //   agency_admin adds agency-layer items and suppresses baseline items.
+    // Ranks are agency-only and live in Agency Settings.
+
+    const content = document.getElementById('content');
+    const { profile } = await bootPage('content', 'Content Manager');
+    const isSuper = profile.role === 'super_admin';
+
+    // super_admin editing the baseline needs no agency; suppression view does.
+    // We resolve agency context softly: baseline mode works with agencyId null.
+    let agencyId = profile.agency_id || new URLSearchParams(location.search).get('agency_id');
+
+    // Editing scope: super_admin edits baseline rows; agency_admin edits agency rows.
+    const editingBaseline = isSuper;
+
+    let tab = new URLSearchParams(location.search).get('tab') || 'incidents';
+    let suppressions = [];        // this agency's suppressions (agency mode only)
+    let incidentTypes = [];
+    let selectedIncident = null;  // incident type id for the KPI panel
+
+    await boot();
+
+    async function boot() {
+      renderLoading(content, 'Loading content…');
+      try {
+        if (agencyId) {
+          const { data, error } = await supabase.from('content_suppressions')
+            .select('id, content_type, content_id').eq('agency_id', agencyId);
+          if (error) throw error;
+          suppressions = data || [];
+        }
+      } catch (e) {
+        showError(e, 'Content manager'); renderErrorState(content); return;
+      }
+      renderShell();
+    }
+
+    function isSuppressed(type, id) {
+      return suppressions.some((s) => s.content_type === type && s.content_id === id);
+    }
+
+    function renderShell() {
+      content.innerHTML = `
+        ${isSuper && !agencyId ? `
+          <div class="notice" style="margin-bottom:14px;">
+            You are editing the <strong>global baseline</strong> shared by every agency.
+            To manage a specific agency's layer and suppressions, open Content from that agency's Admin panel (adds <code>?agency_id=</code>).
+          </div>` : ''}
+        <div class="tabs">
+          <button class="tab ${tab === 'incidents' ? 'active' : ''}" data-tab="incidents">Incident Types & KPIs</button>
+          <button class="tab ${tab === 'safety' ? 'active' : ''}" data-tab="safety">Safety Checklist</button>
+          <button class="tab ${tab === 'dispositions' ? 'active' : ''}" data-tab="dispositions">Dispositions</button>
+        </div>
+        <div id="tab-body" style="margin-top:20px;"></div>
+        <div id="modal-slot"></div>`;
+      content.querySelectorAll('[data-tab]').forEach((b) => {
+        b.addEventListener('click', () => {
+          tab = b.dataset.tab;
+          const p = new URLSearchParams(location.search); p.set('tab', tab);
+          history.replaceState(null, '', `?${p}`);
+          renderShell();
+        });
+      });
+      const body = document.getElementById('tab-body');
+      if (tab === 'incidents') renderIncidents(body);
+      else if (tab === 'safety') renderSimpleList(body, {
+        table: 'safety_checklist_items', type: 'safety_item',
+        textCol: 'item_text', title: 'Officer Safety Deficiency Items',
+        hint: 'Shown as the collapsible safety checklist on every review.',
+      });
+      else renderDispositions(body);
+    }
+
+    // ---- Shared row actions ------------------------------------------------
+    function rowBadges(row) {
+      const bits = [];
+      if (row.agency_id === null) bits.push('<span class="pill pill-accent">baseline</span>');
+      else bits.push('<span class="pill">agency</span>');
+      if (agencyId && row.agency_id === null && isSuppressed(currentType(), row.id)) {
+        bits.push('<span class="pill pill-danger">suppressed</span>');
+      }
+      return bits.join(' ');
+    }
+    function currentType() {
+      return tab === 'incidents' ? 'incident_type' : tab === 'safety' ? 'safety_item' : 'disposition';
+    }
+
+    function canEditRow(row) {
+      // super_admin edits baseline rows (and agency rows when in an agency context);
+      // agency_admin edits only their agency's rows.
+      if (isSuper) return true;
+      return row.agency_id === agencyId;
+    }
+    function canSuppressRow(row) {
+      return !!agencyId && row.agency_id === null;
+    }
+
+    async function toggleSuppress(type, row, refresh) {
+      const existing = suppressions.find((s) => s.content_type === type && s.content_id === row.id);
+      try {
+        if (existing) {
+          const { error } = await supabase.from('content_suppressions').delete().eq('id', existing.id);
+          if (error) throw error;
+          suppressions = suppressions.filter((s) => s.id !== existing.id);
+          await logActivity(profile, 'content_unsuppress', type, row.id, {});
+          toast('Baseline item restored for this agency.', 'success');
+        } else {
+          const { data, error } = await supabase.from('content_suppressions')
+            .insert({ agency_id: agencyId, content_type: type, content_id: row.id })
+            .select('id, content_type, content_id').single();
+          if (error) throw error;
+          suppressions.push(data);
+          await logActivity(profile, 'content_suppress', type, row.id, {});
+          toast('Baseline item hidden for this agency.', 'success');
+        }
+        refresh();
+      } catch (e) { showError(e, 'Suppression'); }
+    }
+
+    // =====================================================================
+    // TAB: INCIDENT TYPES & KPIs (master/detail)
+    // =====================================================================
+    async function renderIncidents(body) {
+      renderLoading(body, 'Loading incident types…');
+      try {
+        const { data, error } = await supabase.from('incident_types')
+          .select('id, agency_id, name, is_active, sort_order')
+          .order('sort_order').order('name');
+        if (error) throw error;
+        // Visible set: baseline + this agency's items (RLS narrows further).
+        incidentTypes = (data || []).filter((r) => r.agency_id === null || r.agency_id === agencyId);
+      } catch (e) {
+        showError(e, 'Incident types'); renderErrorState(body); return;
+      }
+
+      if (!selectedIncident && incidentTypes.length) selectedIncident = incidentTypes[0].id;
+
+      body.innerHTML = `
+        <div style="display:grid; grid-template-columns: 320px 1fr; gap:20px;">
+          <div class="card">
+            <div class="flex-between">
+              <h3 class="card-title mb-0">Incident Types</h3>
+              <button class="btn btn-primary btn-sm" id="btn-add-it">Add</button>
+            </div>
+            <div id="it-list" style="margin-top:12px;"></div>
+          </div>
+          <div class="card">
+            <div id="kpi-panel"></div>
+          </div>
+        </div>`;
+
+      body.querySelector('#btn-add-it').addEventListener('click', () => openTextModal({
+        title: 'Add Incident Type',
+        label: 'Incident type name',
+        onSave: async (name) => {
+          const { data, error } = await supabase.from('incident_types').insert({
+            agency_id: editingBaseline && !agencyId ? null : (editingBaseline ? null : agencyId),
+            name, is_global_default: editingBaseline && !agencyId,
+            sort_order: incidentTypes.length + 1,
+          }).select('id').single();
+          if (error) throw error;
+          await logActivity(profile, 'incident_type_add', 'incident_types', data.id, { name });
+          toast('Incident type added.', 'success');
+          renderIncidents(body);
+        },
+      }));
+
+      const list = body.querySelector('#it-list');
+      if (!incidentTypes.length) {
+        renderEmpty(list, 'No incident types', 'Add your first incident type.');
+      } else {
+        list.innerHTML = incidentTypes.map((it) => `
+          <div class="check-item ${selectedIncident === it.id ? 'sel' : ''}" data-it="${escAttr(it.id)}"
+               style="display:flex; justify-content:space-between; align-items:center; cursor:pointer; gap:8px; ${selectedIncident === it.id ? 'border-color:var(--accent);' : ''} ${!it.is_active ? 'opacity:0.5;' : ''}">
+            <span>${escHtml(it.name)}${it.is_active ? '' : ' <span class="text-muted">(inactive)</span>'}</span>
+            <span>${rowBadges(it)}</span>
+          </div>`).join('');
+        list.querySelectorAll('[data-it]').forEach((el) => {
+          el.addEventListener('click', () => { selectedIncident = el.dataset.it; renderIncidents(body); });
+        });
+      }
+
+      await renderKpiPanel(body.querySelector('#kpi-panel'));
+    }
+
+    async function renderKpiPanel(panel) {
+      const it = incidentTypes.find((x) => x.id === selectedIncident);
+      if (!it) { panel.innerHTML = '<p class="text-muted">Select an incident type to manage its KPIs.</p>'; return; }
+      renderLoading(panel, 'Loading KPIs…');
+
+      let kpis;
+      try {
+        const { data, error } = await supabase.from('kpi_definitions')
+          .select('id, agency_id, kpi_text, sort_order, is_active')
+          .eq('incident_type_id', it.id)
+          .order('sort_order');
+        if (error) throw error;
+        kpis = (data || []).filter((r) => r.agency_id === null || r.agency_id === agencyId);
+      } catch (e) {
+        showError(e, 'KPIs'); renderErrorState(panel); return;
+      }
+
+      panel.innerHTML = `
+        <div class="flex-between">
+          <div>
+            <h3 class="card-title mb-0">${escHtml(it.name)} — KPIs</h3>
+            <p class="text-muted" style="margin:4px 0 0;">${kpis.length} KPI${kpis.length === 1 ? '' : 's'} · these render as the Observed / Not Observed / N/A checklist.</p>
+          </div>
+          <div style="display:flex; gap:8px;">
+            ${canEditRow(it) ? `
+              <button class="btn btn-secondary btn-sm" id="btn-rename-it">Rename</button>
+              <button class="btn ${it.is_active ? 'btn-danger' : 'btn-success'} btn-sm" id="btn-toggle-it">${it.is_active ? 'Deactivate' : 'Reactivate'}</button>` : ''}
+            ${canSuppressRow(it) ? `
+              <button class="btn btn-secondary btn-sm" id="btn-suppress-it">${isSuppressed('incident_type', it.id) ? 'Unsuppress' : 'Suppress for Agency'}</button>` : ''}
+            <button class="btn btn-primary btn-sm" id="btn-add-kpi">Add KPI</button>
+          </div>
+        </div>
+        <div id="kpi-list" style="margin-top:14px;"></div>`;
+
+      panel.querySelector('#btn-add-kpi').addEventListener('click', () => openTextModal({
+        title: `Add KPI — ${it.name}`, label: 'KPI text', textarea: true,
+        onSave: async (text) => {
+          const { data, error } = await supabase.from('kpi_definitions').insert({
+            incident_type_id: it.id,
+            agency_id: editingBaseline ? null : agencyId,
+            kpi_text: text, sort_order: kpis.length + 1,
+          }).select('id').single();
+          if (error) throw error;
+          await logActivity(profile, 'kpi_add', 'kpi_definitions', data.id, { incident_type: it.name });
+          toast('KPI added.', 'success');
+          renderKpiPanel(panel);
+        },
+      }));
+
+      panel.querySelector('#btn-rename-it')?.addEventListener('click', () => openTextModal({
+        title: 'Rename Incident Type', label: 'Name', value: it.name,
+        onSave: async (name) => {
+          const { error } = await supabase.from('incident_types').update({ name }).eq('id', it.id);
+          if (error) throw error;
+          await logActivity(profile, 'incident_type_rename', 'incident_types', it.id, { name });
+          toast('Renamed.', 'success');
+          renderIncidents(document.getElementById('tab-body'));
+        },
+      }));
+
+      panel.querySelector('#btn-toggle-it')?.addEventListener('click', async () => {
+        try {
+          const { error } = await supabase.from('incident_types')
+            .update({ is_active: !it.is_active }).eq('id', it.id);
+          if (error) throw error;
+          await logActivity(profile, it.is_active ? 'incident_type_deactivate' : 'incident_type_reactivate', 'incident_types', it.id, { name: it.name });
+          toast('Incident type updated.', 'success');
+          renderIncidents(document.getElementById('tab-body'));
+        } catch (e) { showError(e, 'Update incident type'); }
+      });
+
+      panel.querySelector('#btn-suppress-it')?.addEventListener('click', () =>
+        toggleSuppress('incident_type', it, () => renderIncidents(document.getElementById('tab-body'))));
+
+      const listEl = panel.querySelector('#kpi-list');
+      if (!kpis.length) {
+        renderEmpty(listEl, 'No KPIs', 'Add the first KPI for this incident type.');
+        return;
+      }
+      listEl.innerHTML = `
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th style="width:60px;">#</th><th>KPI</th><th>Layer</th><th></th></tr></thead>
+          <tbody>${kpis.map((k) => `
+            <tr style="${!k.is_active ? 'opacity:0.5;' : ''}">
+              <td>${k.sort_order}</td>
+              <td>${escHtml(k.kpi_text)}${k.is_active ? '' : ' <span class="text-muted">(inactive)</span>'}</td>
+              <td>${k.agency_id === null
+                ? `<span class="pill pill-accent">baseline</span>${agencyId && isSuppressed('kpi', k.id) ? ' <span class="pill pill-danger">suppressed</span>' : ''}`
+                : '<span class="pill">agency</span>'}</td>
+              <td style="white-space:nowrap;">
+                ${canEditRow(k) ? `
+                  <button class="btn btn-secondary btn-sm" data-edit-kpi="${escAttr(k.id)}">Edit</button>
+                  <button class="btn ${k.is_active ? 'btn-danger' : 'btn-success'} btn-sm" data-toggle-kpi="${escAttr(k.id)}">${k.is_active ? 'Deactivate' : 'Restore'}</button>` : ''}
+                ${!canEditRow(k) && canSuppressRow(k) ? `
+                  <button class="btn btn-secondary btn-sm" data-suppress-kpi="${escAttr(k.id)}">${isSuppressed('kpi', k.id) ? 'Unsuppress' : 'Suppress'}</button>` : ''}
+              </td>
+            </tr>`).join('')}
+          </tbody></table></div>`;
+
+      listEl.querySelectorAll('[data-edit-kpi]').forEach((b) => {
+        const k = kpis.find((x) => x.id === b.dataset.editKpi);
+        b.addEventListener('click', () => openTextModal({
+          title: 'Edit KPI', label: 'KPI text', value: k.kpi_text, textarea: true,
+          onSave: async (text) => {
+            const { error } = await supabase.from('kpi_definitions').update({ kpi_text: text }).eq('id', k.id);
+            if (error) throw error;
+            await logActivity(profile, 'kpi_update', 'kpi_definitions', k.id, {});
+            toast('KPI updated.', 'success');
+            renderKpiPanel(panel);
+          },
+        }));
+      });
+      listEl.querySelectorAll('[data-toggle-kpi]').forEach((b) => {
+        const k = kpis.find((x) => x.id === b.dataset.toggleKpi);
+        b.addEventListener('click', async () => {
+          try {
+            const { error } = await supabase.from('kpi_definitions')
+              .update({ is_active: !k.is_active }).eq('id', k.id);
+            if (error) throw error;
+            await logActivity(profile, k.is_active ? 'kpi_deactivate' : 'kpi_restore', 'kpi_definitions', k.id, {});
+            toast('KPI updated.', 'success');
+            renderKpiPanel(panel);
+          } catch (e) { showError(e, 'Update KPI'); }
+        });
+      });
+      listEl.querySelectorAll('[data-suppress-kpi]').forEach((b) => {
+        const k = kpis.find((x) => x.id === b.dataset.suppressKpi);
+        b.addEventListener('click', () => toggleSuppress('kpi', k, () => renderKpiPanel(panel)));
+      });
+    }
+
+    // =====================================================================
+    // TAB: SAFETY ITEMS (simple list; shared with the same model)
+    // =====================================================================
+    async function renderSimpleList(body, cfg) {
+      renderLoading(body, `Loading ${cfg.title.toLowerCase()}…`);
+      let rows;
+      try {
+        const { data, error } = await supabase.from(cfg.table)
+          .select('*').order('sort_order');
+        if (error) throw error;
+        rows = (data || []).filter((r) => r.agency_id === null || r.agency_id === agencyId);
+      } catch (e) {
+        showError(e, cfg.title); renderErrorState(body); return;
+      }
+
+      const type = cfg.type;
+      body.innerHTML = `
+        <div class="card">
+          <div class="flex-between">
+            <div>
+              <h3 class="card-title mb-0">${escHtml(cfg.title)}</h3>
+              <p class="text-muted" style="margin:4px 0 0;">${escHtml(cfg.hint)}</p>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btn-add-item">Add Item</button>
+          </div>
+          <div id="item-list" style="margin-top:14px;"></div>
+        </div>`;
+
+      body.querySelector('#btn-add-item').addEventListener('click', () => openTextModal({
+        title: `Add — ${cfg.title}`, label: 'Item text', textarea: true,
+        onSave: async (text) => {
+          const { data, error } = await supabase.from(cfg.table).insert({
+            agency_id: editingBaseline ? null : agencyId,
+            [cfg.textCol]: text, sort_order: rows.length + 1,
+          }).select('id').single();
+          if (error) throw error;
+          await logActivity(profile, `${type}_add`, cfg.table, data.id, {});
+          toast('Item added.', 'success');
+          renderSimpleList(body, cfg);
+        },
+      }));
+
+      const listEl = body.querySelector('#item-list');
+      if (!rows.length) {
+        renderEmpty(listEl, 'No items', 'Add your first item.');
+        return;
+      }
+      listEl.innerHTML = `
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th style="width:60px;">#</th><th>Item</th><th>Layer</th><th></th></tr></thead>
+          <tbody>${rows.map((r) => `
+            <tr style="${!r.is_active ? 'opacity:0.5;' : ''}">
+              <td>${r.sort_order}</td>
+              <td>${escHtml(r[cfg.textCol])}${r.is_active ? '' : ' <span class="text-muted">(inactive)</span>'}</td>
+              <td>${r.agency_id === null
+                ? `<span class="pill pill-accent">baseline</span>${agencyId && isSuppressed(type, r.id) ? ' <span class="pill pill-danger">suppressed</span>' : ''}`
+                : '<span class="pill">agency</span>'}</td>
+              <td style="white-space:nowrap;">
+                ${canEditRow(r) ? `
+                  <button class="btn btn-secondary btn-sm" data-edit="${escAttr(r.id)}">Edit</button>
+                  <button class="btn ${r.is_active ? 'btn-danger' : 'btn-success'} btn-sm" data-toggle="${escAttr(r.id)}">${r.is_active ? 'Deactivate' : 'Restore'}</button>` : ''}
+                ${!canEditRow(r) && canSuppressRow(r) ? `
+                  <button class="btn btn-secondary btn-sm" data-suppress="${escAttr(r.id)}">${isSuppressed(type, r.id) ? 'Unsuppress' : 'Suppress'}</button>` : ''}
+              </td>
+            </tr>`).join('')}
+          </tbody></table></div>`;
+
+      listEl.querySelectorAll('[data-edit]').forEach((b) => {
+        const r = rows.find((x) => x.id === b.dataset.edit);
+        b.addEventListener('click', () => openTextModal({
+          title: 'Edit Item', label: 'Item text', value: r[cfg.textCol], textarea: true,
+          onSave: async (text) => {
+            const { error } = await supabase.from(cfg.table).update({ [cfg.textCol]: text }).eq('id', r.id);
+            if (error) throw error;
+            await logActivity(profile, `${type}_update`, cfg.table, r.id, {});
+            toast('Item updated.', 'success');
+            renderSimpleList(body, cfg);
+          },
+        }));
+      });
+      listEl.querySelectorAll('[data-toggle]').forEach((b) => {
+        const r = rows.find((x) => x.id === b.dataset.toggle);
+        b.addEventListener('click', async () => {
+          try {
+            const { error } = await supabase.from(cfg.table)
+              .update({ is_active: !r.is_active }).eq('id', r.id);
+            if (error) throw error;
+            await logActivity(profile, `${type}_toggle`, cfg.table, r.id, { active: !r.is_active });
+            toast('Item updated.', 'success');
+            renderSimpleList(body, cfg);
+          } catch (e) { showError(e, 'Update item'); }
+        });
+      });
+      listEl.querySelectorAll('[data-suppress]').forEach((b) => {
+        const r = rows.find((x) => x.id === b.dataset.suppress);
+        b.addEventListener('click', () => toggleSuppress(type, r, () => renderSimpleList(body, cfg)));
+      });
+    }
+
+    // =====================================================================
+    // TAB: DISPOSITIONS (code + label)
+    // =====================================================================
+    async function renderDispositions(body) {
+      renderLoading(body, 'Loading dispositions…');
+      let rows;
+      try {
+        const { data, error } = await supabase.from('disposition_types')
+          .select('*').order('sort_order');
+        if (error) throw error;
+        rows = (data || []).filter((r) => r.agency_id === null || r.agency_id === agencyId);
+      } catch (e) {
+        showError(e, 'Dispositions'); renderErrorState(body); return;
+      }
+
+      body.innerHTML = `
+        <div class="card">
+          <div class="flex-between">
+            <div>
+              <h3 class="card-title mb-0">Disposition Types</h3>
+              <p class="text-muted" style="margin:4px 0 0;">Codes are stable identifiers stored on reviews — never change a code once in use; deactivate and add a new one instead.</p>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btn-add-disp">Add Disposition</button>
+          </div>
+          <div id="disp-list" style="margin-top:14px;"></div>
+        </div>`;
+
+      body.querySelector('#btn-add-disp').addEventListener('click', () => openDispModal(null));
+
+      const listEl = body.querySelector('#disp-list');
+      if (!rows.length) {
+        renderEmpty(listEl, 'No dispositions', 'Add your first disposition type.');
+        return;
+      }
+      listEl.innerHTML = `
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th style="width:60px;">#</th><th>Code</th><th>Label</th><th>Layer</th><th></th></tr></thead>
+          <tbody>${rows.map((r) => `
+            <tr style="${!r.is_active ? 'opacity:0.5;' : ''}">
+              <td>${r.sort_order}</td>
+              <td><code>${escHtml(r.code)}</code></td>
+              <td>${escHtml(r.label)}${r.is_active ? '' : ' <span class="text-muted">(inactive)</span>'}</td>
+              <td>${r.agency_id === null
+                ? `<span class="pill pill-accent">baseline</span>${agencyId && isSuppressed('disposition', r.id) ? ' <span class="pill pill-danger">suppressed</span>' : ''}`
+                : '<span class="pill">agency</span>'}</td>
+              <td style="white-space:nowrap;">
+                ${canEditRow(r) ? `
+                  <button class="btn btn-secondary btn-sm" data-edit="${escAttr(r.id)}">Edit Label</button>
+                  <button class="btn ${r.is_active ? 'btn-danger' : 'btn-success'} btn-sm" data-toggle="${escAttr(r.id)}">${r.is_active ? 'Deactivate' : 'Restore'}</button>` : ''}
+                ${!canEditRow(r) && canSuppressRow(r) ? `
+                  <button class="btn btn-secondary btn-sm" data-suppress="${escAttr(r.id)}">${isSuppressed('disposition', r.id) ? 'Unsuppress' : 'Suppress'}</button>` : ''}
+              </td>
+            </tr>`).join('')}
+          </tbody></table></div>`;
+
+      listEl.querySelectorAll('[data-edit]').forEach((b) => {
+        b.addEventListener('click', () => openDispModal(rows.find((x) => x.id === b.dataset.edit)));
+      });
+      listEl.querySelectorAll('[data-toggle]').forEach((b) => {
+        const r = rows.find((x) => x.id === b.dataset.toggle);
+        b.addEventListener('click', async () => {
+          try {
+            const { error } = await supabase.from('disposition_types')
+              .update({ is_active: !r.is_active }).eq('id', r.id);
+            if (error) throw error;
+            await logActivity(profile, 'disposition_toggle', 'disposition_types', r.id, { active: !r.is_active });
+            toast('Disposition updated.', 'success');
+            renderDispositions(body);
+          } catch (e) { showError(e, 'Update disposition'); }
+        });
+      });
+      listEl.querySelectorAll('[data-suppress]').forEach((b) => {
+        const r = rows.find((x) => x.id === b.dataset.suppress);
+        b.addEventListener('click', () => toggleSuppress('disposition', r, () => renderDispositions(body)));
+      });
+
+      function openDispModal(disp) {
+        const isEdit = !!disp;
+        const slot = document.getElementById('modal-slot');
+        slot.innerHTML = `
+          <div class="modal-backdrop">
+            <div class="modal">
+              <h3 class="card-title">${isEdit ? 'Edit Disposition' : 'Add Disposition'}</h3>
+              <div class="form-grid">
+                <div class="form-row">
+                  <div><label class="field-label">Code *</label>
+                    <input id="dp-code" value="${escAttr(disp?.code || '')}" ${isEdit ? 'disabled' : ''} placeholder="e.g. citation_issued" /></div>
+                  <div><label class="field-label">Label *</label>
+                    <input id="dp-label" value="${escAttr(disp?.label || '')}" placeholder="e.g. Citation Issued" /></div>
+                </div>
+              </div>
+              ${!isEdit ? '<p class="text-muted" style="margin-top:8px;">Codes: lowercase letters and underscores only. They are permanent once used on reviews.</p>' : ''}
+              <div class="flex-between" style="margin-top:16px;">
+                <button class="btn btn-secondary" id="dp-cancel">Cancel</button>
+                <button class="btn btn-primary" id="dp-save">${isEdit ? 'Save' : 'Add'}</button>
+              </div>
+            </div>
+          </div>`;
+        slot.querySelector('#dp-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+        slot.querySelector('#dp-save').addEventListener('click', async () => {
+          const label = slot.querySelector('#dp-label').value.trim();
+          if (!label) { toast('Label is required.', 'error'); return; }
+          try {
+            if (isEdit) {
+              const { error } = await supabase.from('disposition_types').update({ label }).eq('id', disp.id);
+              if (error) throw error;
+              await logActivity(profile, 'disposition_update', 'disposition_types', disp.id, { label });
+            } else {
+              const code = slot.querySelector('#dp-code').value.trim().toLowerCase();
+              if (!/^[a-z][a-z0-9_]*$/.test(code)) { toast('Code must be lowercase letters, numbers, and underscores.', 'error'); return; }
+              const { data, error } = await supabase.from('disposition_types').insert({
+                agency_id: editingBaseline ? null : agencyId,
+                code, label, sort_order: rows.length + 1,
+              }).select('id').single();
+              if (error) throw error;
+              await logActivity(profile, 'disposition_add', 'disposition_types', data.id, { code, label });
+            }
+            slot.innerHTML = '';
+            toast('Disposition saved.', 'success');
+            renderDispositions(body);
+          } catch (e) { showError(e, 'Save disposition'); }
+        });
+      }
+    }
+
+    // ---- Reusable single-text-field modal ---------------------------------
+    function openTextModal({ title, label, value = '', textarea = false, onSave }) {
+      const slot = document.getElementById('modal-slot');
+      slot.innerHTML = `
+        <div class="modal-backdrop">
+          <div class="modal">
+            <h3 class="card-title">${escHtml(title)}</h3>
+            <div class="form-grid">
+              <div><label class="field-label">${escHtml(label)} *</label>
+                ${textarea
+                  ? `<textarea id="tm-value" rows="3">${escHtml(value)}</textarea>`
+                  : `<input id="tm-value" value="${escAttr(value)}" />`}
+              </div>
+            </div>
+            <div class="flex-between" style="margin-top:16px;">
+              <button class="btn btn-secondary" id="tm-cancel">Cancel</button>
+              <button class="btn btn-primary" id="tm-save">Save</button>
+            </div>
+          </div>
+        </div>`;
+      slot.querySelector('#tm-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+      slot.querySelector('#tm-save').addEventListener('click', async () => {
+        const text = slot.querySelector('#tm-value').value.trim();
+        if (!text) { toast(`${label} is required.`, 'error'); return; }
+        const btn = slot.querySelector('#tm-save');
+        btn.disabled = true;
+        try {
+          await onSave(text);
+          slot.innerHTML = '';
+        } catch (e) {
+          showError(e, title);
+          btn.disabled = false;
+        }
+      });
+    }
+  </script>
+</body>
+</html>
