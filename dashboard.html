@@ -45,12 +45,13 @@
         case 'agency_admin':     await agencyAdminDash(); break;
         case 'supervisor':       await supervisorDash(); break;
       }
-      // Performance Scoring panel — all agency roles (and super_admin when an
-      // agency context is selected via ?agency_id=). Appended after the role
-      // dashboard so a scoring failure never blanks the whole page.
+      // Performance Scoring panel — TOP of the page for all agency roles (and
+      // super_admin with an ?agency_id= context). Prepended after the role
+      // dashboard renders so a scoring failure never blanks the page.
       if (agencyId) {
         const panel = document.createElement('div');
-        content.appendChild(panel);
+        panel.style.marginBottom = '20px';
+        content.prepend(panel);
         mountScoringPanel(panel, { profile, agencyId, threshold })
           .catch((e) => showError(e, 'Performance scoring'));
       }

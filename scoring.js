@@ -1,26 +1,22 @@
 // ============================================================================
-// ATLAS — scoring.js
-// SINGLE SOURCE OF TRUTH for outcome-based performance scoring.
+// ATLAS — scoring.js  (v5.2)
+// SINGLE SOURCE OF TRUTH for outcome-based performance scoring + charts.
 //
-// The Performance Score is a positive-outcome ratio:
-//     score = round( (no_action + commendation) / total_reviews * 100 )
-// Whole numbers. No partial weights. No penalties — corrective outcomes
-// simply grow the denominator.
+//   Performance Score = round( (no_action + commendation) / total * 100 )
+//   Whole numbers. No partial weights. No penalties.
 //
-// Guardrail: only canonical review_outcome enum values participate. The DB
-// enum physically prevents non-canonical values; anything unexpected that
-// reaches this module is counted as non-positive (never as positive).
+// Guardrail: only canonical review_outcome enum values participate. Unknown
+// values grow the denominator but can never count as positive.
 //
-// The per-review kpi_score (observed / (observed + not_observed)) is a
-// SEPARATE metric — an observation-frequency score shown on review rows and
-// in searches. It does not feed this module.
+// kpi_score (observed frequency) is a SEPARATE per-review metric.
 //
-// Acceptance test vector (see verifyAcceptanceVector below):
-//   input : [No Action, No Action, Commendation, Training, Coaching]
-//   output: { total_reviews: 5, positive_reviews: 3, positive_percentage: 60 }
+// Acceptance vector: [NA, NA, Comm, Training, Coaching] → 5 / 3 / 60.
 // ============================================================================
+import { supabase } from './supabase-client.js';
+import { OfficerSearch } from './officer-search.js';
+import { escHtml, escAttr, showError, toast } from './error-handler.js';
 
-// Canonical classification — keys are the review_outcome enum values.
+// ---------------------------------------------------------------- canonical
 export const OUTCOME_CLASSIFICATION = {
   no_action:        'positive',
   commendation:     'positive',
@@ -29,31 +25,33 @@ export const OUTCOME_CLASSIFICATION = {
   internal_affairs: 'corrective',
   pip:              'corrective',
 };
-
-export const POSITIVE_OUTCOMES = Object.keys(OUTCOME_CLASSIFICATION)
-  .filter((k) => OUTCOME_CLASSIFICATION[k] === 'positive');
+export const POSITIVE_OUTCOMES = ['no_action', 'commendation'];
+export const OUTCOME_LABELS = {
+  no_action: 'No Action', commendation: 'Commendation', coaching: 'Coaching',
+  training: 'Training', internal_affairs: 'Internal Affairs', pip: 'PIP',
+};
+// Chart palette — grouped: Positive (greens) / Development (ambers) /
+// Accountability (red, purple). Fixed hexes for chart legibility.
+export const OUTCOME_COLORS = {
+  no_action: '#2e9e5b', commendation: '#19b8a6', coaching: '#e0a622',
+  training: '#e07b22', internal_affairs: '#d64545', pip: '#8a4fc9',
+};
 
 export function classifyOutcome(outcome) {
-  return OUTCOME_CLASSIFICATION[outcome] || 'corrective'; // unknown → never positive
+  return OUTCOME_CLASSIFICATION[outcome] || 'corrective';
 }
 
-// ---------------------------------------------------------------------------
-// computeScorePackage — the "fully baked" distribution package.
-// Accepts an array of reviews (each with .follow_up_outcome) already loaded
-// on the client. For RLS-safe aggregates over data the caller can't read
-// row-by-row, use the fetch* RPC wrappers below instead.
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------- compute
 export function computeScorePackage(reviews) {
   const rows = Array.isArray(reviews) ? reviews : [];
-  const distribution = {
-    no_action: 0, commendation: 0, coaching: 0,
-    training: 0, internal_affairs: 0, pip: 0,
-  };
+  const distribution = { no_action: 0, commendation: 0, coaching: 0, training: 0, internal_affairs: 0, pip: 0 };
   let positive = 0;
   for (const r of rows) {
     const o = r?.follow_up_outcome;
-    if (o in distribution) distribution[o] += 1;
-    if (classifyOutcome(o) === 'positive' && (o in distribution)) positive += 1;
+    if (o in distribution) {
+      distribution[o] += 1;
+      if (classifyOutcome(o) === 'positive') positive += 1;
+    }
   }
   const total = rows.length;
   return {
@@ -64,180 +62,297 @@ export function computeScorePackage(reviews) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// RLS-safe aggregate fetchers.
-// These call SECURITY DEFINER functions (migration-outcome-score.sql) that
-// return ONLY aggregate packages — no confidential row data — so every
-// agency role (including supervisors, who can't read other reviewers' rows)
-// gets the same correct number.
-// ---------------------------------------------------------------------------
-import { supabase } from './supabase-client.js';
-
+// ---------------------------------------------------------------- RPC (RLS-safe)
 export async function fetchAgencyScore(agencyId) {
   const { data, error } = await supabase.rpc('agency_score_package', { p_agency_id: agencyId });
-  if (error) throw error;
-  return data;
+  if (error) throw error; return data;
 }
-
 export async function fetchOfficerScore(officerId) {
   const { data, error } = await supabase.rpc('officer_score_package', { p_officer_id: officerId });
-  if (error) throw error;
-  return data;
+  if (error) throw error; return data;
 }
-
 export async function fetchGroupScore(officerIds) {
   const { data, error } = await supabase.rpc('group_score_package', { p_officer_ids: officerIds });
-  if (error) throw error;
-  return data;
+  if (error) throw error; return data;
+}
+export async function fetchMonthlySeries(agencyId, months = 8) {
+  const { data, error } = await supabase.rpc('monthly_score_series', { p_agency_id: agencyId, p_months: months });
+  if (error) throw error; return data || [];
+}
+export async function fetchOfficerScoreTable(agencyId, officerIds = null) {
+  const { data, error } = await supabase.rpc('agency_officer_scores', { p_agency_id: agencyId, p_officer_ids: officerIds });
+  if (error) throw error; return data || [];
 }
 
-// ---------------------------------------------------------------------------
-// Shared render helpers — one visual language for score packages everywhere.
-// ---------------------------------------------------------------------------
-import { escHtml } from './error-handler.js';
-
-export const OUTCOME_LABELS = {
-  no_action: 'No Action', commendation: 'Commendation', coaching: 'Coaching',
-  training: 'Training', internal_affairs: 'Internal Affairs', pip: 'PIP',
-};
-
+// ---------------------------------------------------------------- tones
 export function scoreTone(pct, threshold = 80) {
   if (pct === null || pct === undefined) return '';
   if (pct >= threshold) return 'success';
   if (pct >= 65) return 'warning';
   return 'danger';
 }
+const TONE_HEX = { success: '#2e9e5b', warning: '#e0a622', danger: '#d64545', '': '#7a869a' };
 
-// Big score number + supporting counts
-export function renderScoreCard(pkg, { title, threshold = 80, sub = '' } = {}) {
+// ============================================================================
+// SVG CHART COMPONENTS — no libraries, all inline.
+// ============================================================================
+
+// Donut — agency headline score
+export function renderDonut(pkg, { threshold = 80, size = 150 } = {}) {
   const pct = pkg.positive_percentage;
+  const hex = TONE_HEX[scoreTone(pct, threshold)];
+  const r = 56, c = 2 * Math.PI * r;
+  const filled = pct === null ? 0 : (pct / 100) * c;
   return `
-    <div class="stat ${scoreTone(pct, threshold)}">
-      <div class="stat-value">${pct === null ? '—' : escHtml(String(pct)) + '%'}</div>
-      <div class="stat-label">${escHtml(title || 'Performance Score')}</div>
-      <div class="text-muted" style="font-size:11px; margin-top:4px;">
-        ${escHtml(String(pkg.positive_reviews))} positive / ${escHtml(String(pkg.total_reviews))} reviews${sub ? ' · ' + escHtml(sub) : ''}
-      </div>
+    <svg viewBox="0 0 140 140" width="${size}" height="${size}" role="img" aria-label="Performance score donut">
+      <circle cx="70" cy="70" r="${r}" fill="none" stroke="var(--bg-elevated)" stroke-width="16"/>
+      <circle cx="70" cy="70" r="${r}" fill="none" stroke="${hex}" stroke-width="16"
+              stroke-dasharray="${filled.toFixed(1)} ${c.toFixed(1)}" stroke-linecap="round"
+              transform="rotate(-90 70 70)"/>
+      <text x="70" y="66" text-anchor="middle" font-size="26" font-weight="700" fill="currentColor">
+        ${pct === null ? '—' : pct + '%'}</text>
+      <text x="70" y="86" text-anchor="middle" font-size="10" fill="var(--text-muted)">
+        ${pkg.positive_reviews} / ${pkg.total_reviews} reviews</text>
+    </svg>`;
+}
+
+// Vertical outcome columns
+export function renderOutcomeColumns(pkg, { width = 320, height = 170 } = {}) {
+  const codes = Object.keys(OUTCOME_LABELS);
+  const max = Math.max(1, ...codes.map((c) => pkg.distribution?.[c] || 0));
+  const pad = 24, bw = (width - pad * 2) / codes.length;
+  const bars = codes.map((code, i) => {
+    const n = pkg.distribution?.[code] || 0;
+    const h = Math.round((n / max) * (height - 55));
+    const x = pad + i * bw;
+    return `
+      <rect x="${(x + bw * 0.15).toFixed(1)}" y="${height - 35 - h}" width="${(bw * 0.7).toFixed(1)}" height="${h}"
+            rx="3" fill="${OUTCOME_COLORS[code]}"/>
+      <text x="${(x + bw / 2).toFixed(1)}" y="${height - 40 - h}" text-anchor="middle" font-size="10" fill="currentColor">${n || ''}</text>
+      <text x="${(x + bw / 2).toFixed(1)}" y="${height - 22}" text-anchor="middle" font-size="8.5" fill="var(--text-muted)">
+        ${escHtml(OUTCOME_LABELS[code].split(' ')[0])}</text>`;
+  }).join('');
+  return `
+    <svg viewBox="0 0 ${width} ${height}" style="width:100%; max-width:${width + 60}px;" role="img" aria-label="Outcome distribution">
+      ${bars}
+      <line x1="${pad - 6}" y1="${height - 35}" x2="${width - pad + 6}" y2="${height - 35}" stroke="var(--border)"/>
+    </svg>
+    <div style="display:flex; gap:14px; flex-wrap:wrap; font-size:11px; margin-top:4px;">
+      <span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#2e9e5b;"></i> Positive: No Action &amp; Commendation</span>
+      <span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#e0a622;"></i> Development: Coaching &amp; Training</span>
+      <span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#d64545;"></i> Accountability: IA &amp; PIP</span>
     </div>`;
 }
 
-// Horizontal distribution bars for the full package
-export function renderDistribution(pkg) {
-  const total = pkg.total_reviews || 0;
-  const tone = { no_action: 'var(--success)', commendation: 'var(--success)',
-                 coaching: 'var(--warning)', training: 'var(--warning)',
-                 internal_affairs: 'var(--danger)', pip: 'var(--danger)' };
+// Monthly positive-ratio line chart
+export function renderMonthlyLine(series, { width = 560, height = 150, threshold = 80 } = {}) {
+  const pad = 30;
+  const pts = (series || []).filter((m) => m.total > 0);
+  if (pts.length < 2) {
+    return `<p class="text-muted" style="font-size:12px;">Not enough monthly data yet — the trend line appears once reviews span two or more months.</p>`;
+  }
+  const x = (i) => pad + (i * (width - pad * 2)) / (pts.length - 1);
+  const y = (p) => height - 24 - (p / 100) * (height - 44);
+  const line = pts.map((m, i) => `${x(i).toFixed(1)},${y(m.pct).toFixed(1)}`).join(' ');
+  const ty = y(threshold).toFixed(1);
+  const labels = pts.map((m, i) => `
+    <text x="${x(i).toFixed(1)}" y="${height - 8}" text-anchor="middle" font-size="8.5" fill="var(--text-muted)">${escHtml(m.month.slice(5))}/${escHtml(m.month.slice(2, 4))}</text>`).join('');
+  const dots = pts.map((m, i) => `
+    <circle cx="${x(i).toFixed(1)}" cy="${y(m.pct).toFixed(1)}" r="3" fill="var(--accent)"/>
+    <text x="${x(i).toFixed(1)}" y="${(y(m.pct) - 7).toFixed(1)}" text-anchor="middle" font-size="8.5" fill="currentColor">${m.pct}%</text>`).join('');
   return `
-    <div>
-      ${Object.entries(OUTCOME_LABELS).map(([code, label]) => {
-        const n = pkg.distribution?.[code] || 0;
-        const w = total ? Math.round((n / total) * 100) : 0;
-        return `
-          <div style="display:grid; grid-template-columns:130px 1fr 40px; gap:8px; align-items:center; margin-bottom:6px;">
-            <span class="text-secondary" style="font-size:12px;">${escHtml(label)}</span>
-            <div style="background:var(--bg-elevated); border-radius:4px; height:10px; overflow:hidden;">
-              <div style="width:${w}%; height:100%; background:${tone[code]};"></div>
-            </div>
-            <span style="font-size:12px; text-align:right;">${n}</span>
-          </div>`;
+    <svg viewBox="0 0 ${width} ${height}" style="width:100%;" role="img" aria-label="Monthly performance ratio">
+      <line x1="${pad}" y1="${ty}" x2="${width - pad}" y2="${ty}" stroke="var(--warning)" stroke-dasharray="4 4" opacity="0.6"/>
+      <text x="${width - pad + 2}" y="${ty}" font-size="8" fill="var(--warning)">${threshold}%</text>
+      <polyline points="${line}" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linejoin="round"/>
+      ${dots}${labels}
+    </svg>`;
+}
+
+// Tiny per-officer distribution bars for the ranking table
+export function renderMiniBars(distribution, { width = 120, height = 26 } = {}) {
+  const codes = Object.keys(OUTCOME_LABELS);
+  const max = Math.max(1, ...codes.map((c) => distribution?.[c] || 0));
+  const bw = width / codes.length;
+  return `
+    <svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="Officer outcome mix">
+      ${codes.map((code, i) => {
+        const n = distribution?.[code] || 0;
+        const h = Math.max(n ? 3 : 0, Math.round((n / max) * (height - 4)));
+        return `<rect x="${(i * bw + 2).toFixed(1)}" y="${height - h}" width="${(bw - 4).toFixed(1)}" height="${h}" rx="1.5" fill="${OUTCOME_COLORS[code]}"><title>${escHtml(OUTCOME_LABELS[code])}: ${n}</title></rect>`;
       }).join('')}
+    </svg>`;
+}
+
+// Horizontal comparison bars (Custom Group vs Agency vs Squad)
+export function renderComparisonBars(rows) {
+  const items = rows.filter((r) => r && r.pct !== null && r.pct !== undefined);
+  if (!items.length) return '';
+  return `
+    <div style="margin-top:12px;">
+      ${items.map((r) => `
+        <div style="display:grid; grid-template-columns:130px 1fr 46px; gap:8px; align-items:center; margin-bottom:8px;">
+          <span class="text-secondary" style="font-size:12px;">${escHtml(r.label)}</span>
+          <div style="background:var(--bg-elevated); border-radius:5px; height:14px; overflow:hidden;">
+            <div style="width:${Math.max(0, Math.min(100, r.pct))}%; height:100%; background:${r.color}; border-radius:5px;"></div>
+          </div>
+          <strong style="font-size:12px; text-align:right;">${r.pct}%</strong>
+        </div>`).join('')}
     </div>`;
 }
 
-// ---------------------------------------------------------------------------
-// mountScoringPanel — the dashboard scoring section.
-// Agency-wide score + distribution, searchable individual officer score,
-// and an ad-hoc group builder (multi-add officers → group score package).
-// Works for every agency role; supervisors' officer search is scoped to
-// their own roster, and they get a "My Squad" card automatically.
-// ---------------------------------------------------------------------------
-import { OfficerSearch } from './officer-search.js';
-import { escAttr, showError, toast } from './error-handler.js';
-
+// ============================================================================
+// mountScoringPanel — top-of-dashboard scoring section (mock layout):
+//   Row 1: donut + legend | outcome columns | ranked officer table w/ search
+//   Row 2: monthly trend line | ad-hoc group builder + comparison bars
+// ============================================================================
 export async function mountScoringPanel(container, { profile, agencyId, threshold = 80 }) {
   const isSupervisor = profile.role === 'supervisor';
   container.innerHTML = `
-    <div class="card" style="margin-top:20px;">
+    <div class="card">
       <h2 class="card-title">Performance Scoring</h2>
       <p class="card-sub" style="margin:4px 0 14px;">
         Positive-outcome ratio: (No Action + Commendation) ÷ total reviews. Whole-number percentage.
       </p>
-      <div class="stat-grid" id="sp-agency-cards"><div class="state-block"><div class="spinner"></div></div></div>
-      <div id="sp-agency-dist" style="max-width:520px; margin-top:10px;"></div>
-
-      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:20px; margin-top:20px;">
-        <div>
-          <h3 class="card-title" style="font-size:14px;">Individual Officer Score</h3>
-          <div id="sp-officer-search"></div>
-          <div id="sp-officer-result" style="margin-top:12px;"></div>
+      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:24px; align-items:start;">
+        <div style="text-align:center;">
+          <div id="sp-donut"><div class="state-block"><div class="spinner"></div></div></div>
+          <div style="font-weight:700; font-size:13px; letter-spacing:0.04em;">AGENCY PERFORMANCE SCORE</div>
+          <div id="sp-donut-sub" class="text-muted" style="font-size:12px;"></div>
+          <div id="sp-squad-line" class="text-secondary" style="font-size:12px; margin-top:4px;"></div>
         </div>
         <div>
-          <h3 class="card-title" style="font-size:14px;">Group Score (ad-hoc)</h3>
+          <h3 class="card-title" style="font-size:13px;">Outcome Distribution</h3>
+          <div id="sp-columns"></div>
+        </div>
+        <div>
+          <h3 class="card-title" style="font-size:13px;">Individual Officer Score</h3>
+          <input id="sp-officer-filter" placeholder="Search officer…" style="width:100%; margin-bottom:8px;"/>
+          <div id="sp-officer-table" style="max-height:260px; overflow-y:auto;">
+            <div class="state-block"><div class="spinner"></div></div>
+          </div>
+        </div>
+      </div>
+
+      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:24px; margin-top:22px;">
+        <div>
+          <h3 class="card-title" style="font-size:13px;">Monthly Performance Ratio</h3>
+          <div id="sp-monthly"><div class="state-block"><div class="spinner"></div></div></div>
+        </div>
+        <div>
+          <h3 class="card-title" style="font-size:13px;">Group Score (ad-hoc)</h3>
           <div id="sp-group-search"></div>
           <div id="sp-group-tags" style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;"></div>
-          <button class="btn btn-primary btn-sm" id="sp-group-run" style="margin-top:10px;">Compute Group Score</button>
-          <div id="sp-group-result" style="margin-top:12px;"></div>
+          <button class="btn btn-primary btn-sm" type="button" id="sp-group-run" style="margin-top:10px;">Compute Group Score</button>
+          <div id="sp-group-result" style="margin-top:6px;"></div>
         </div>
       </div>
     </div>`;
 
-  // --- Agency-wide (+ squad for supervisors) --------------------------------
+  let agencyPkg = null, squadPkg = null, squadIds = null;
+
+  // --- squad ids (supervisor) ------------------------------------------------
+  if (isSupervisor) {
+    const { data: rosterRows } = await supabase.from('supervisor_rosters')
+      .select('officer_id').eq('supervisor_id', profile.id);
+    squadIds = (rosterRows || []).map((r) => r.officer_id);
+  }
+
+  // --- headline: donut + columns ----------------------------------------------
   (async () => {
-    const cards = container.querySelector('#sp-agency-cards');
     try {
-      const agencyPkg = await fetchAgencyScore(agencyId);
-      let squadHtml = '';
-      if (isSupervisor) {
-        const { data: rosterRows } = await supabase.from('supervisor_rosters')
-          .select('officer_id').eq('supervisor_id', profile.id);
-        const ids = (rosterRows || []).map((r) => r.officer_id);
-        if (ids.length) {
-          const squadPkg = await fetchGroupScore(ids);
-          squadHtml = renderScoreCard(squadPkg, { title: 'My Squad Score', threshold });
-        }
+      agencyPkg = await fetchAgencyScore(agencyId);
+      container.querySelector('#sp-donut').innerHTML = renderDonut(agencyPkg, { threshold });
+      container.querySelector('#sp-donut-sub').textContent =
+        `${agencyPkg.positive_percentage ?? '—'}% · ${agencyPkg.positive_reviews} positive / ${agencyPkg.total_reviews} total reviews`;
+      container.querySelector('#sp-columns').innerHTML = renderOutcomeColumns(agencyPkg);
+      if (isSupervisor && squadIds?.length) {
+        squadPkg = await fetchGroupScore(squadIds);
+        container.querySelector('#sp-squad-line').textContent =
+          `My Squad: ${squadPkg.positive_percentage ?? '—'}% (${squadPkg.positive_reviews}/${squadPkg.total_reviews})`;
       }
-      cards.innerHTML = renderScoreCard(agencyPkg, { title: 'Agency Performance Score', threshold }) + squadHtml;
-      container.querySelector('#sp-agency-dist').innerHTML = renderDistribution(agencyPkg);
     } catch (e) {
-      cards.innerHTML = '';
+      container.querySelector('#sp-donut').innerHTML = '';
       showError(e, 'Agency score');
     }
   })();
 
-  // --- Individual officer lookup ---------------------------------------------
-  new OfficerSearch(container.querySelector('#sp-officer-search'), {
-    agencyId,
-    supervisorId: isSupervisor ? profile.id : null,
-    activeOnly: false, // scoring history is valid for inactive officers too
-    placeholder: 'Search officer…',
-    onSelect: async (officer) => {
-      const out = container.querySelector('#sp-officer-result');
-      if (!officer) { out.innerHTML = ''; return; }
-      out.innerHTML = '<div class="state-block"><div class="spinner"></div></div>';
-      try {
-        const pkg = await fetchOfficerScore(officer.id);
-        out.innerHTML = `
-          <div class="stat-grid">${renderScoreCard(pkg, {
-            title: `${officer.last_name}, ${officer.first_name}`, threshold,
-          })}</div>
-          <div style="max-width:480px; margin-top:10px;">${renderDistribution(pkg)}</div>`;
-      } catch (e) { out.innerHTML = ''; showError(e, 'Officer score'); }
-    },
-  });
+  // --- ranked officer table ----------------------------------------------------
+  let officerRows = [];
+  function paintOfficerTable() {
+    const el = container.querySelector('#sp-officer-table');
+    const q = container.querySelector('#sp-officer-filter').value.trim().toLowerCase();
+    const rows = officerRows.filter((o) =>
+      !q || `${o.first_name} ${o.last_name} ${o.badge_number}`.toLowerCase().includes(q));
+    if (!rows.length) {
+      el.innerHTML = '<p class="text-muted" style="font-size:12px;">No officers match.</p>';
+      return;
+    }
+    el.innerHTML = `
+      <table class="data" style="font-size:12px;">
+        <thead><tr><th>#</th><th>Name</th><th>Outcome Mix</th><th>Score</th></tr></thead>
+        <tbody>
+          ${rows.map((o, i) => {
+            const tone = scoreTone(o.pct, threshold);
+            const suffixParam = profile.role === 'super_admin'
+              ? `&agency_id=${encodeURIComponent(agencyId)}` : '';
+            return `
+              <tr>
+                <td>${i + 1}</td>
+                <td><a href="officer-profile.html?officer_id=${encodeURIComponent(o.officer_id)}${suffixParam}">
+                  ${escHtml(`${o.last_name}, ${o.first_name}`)}</a>
+                  <span class="text-muted">#${escHtml(o.badge_number || '')}</span></td>
+                <td>${renderMiniBars(o.distribution)}</td>
+                <td><span class="pill pill-${tone || 'accent'}">${o.pct === null ? '—' : o.pct + '%'}</span></td>
+              </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+  (async () => {
+    try {
+      officerRows = await fetchOfficerScoreTable(agencyId, isSupervisor ? squadIds : null);
+      paintOfficerTable();
+    } catch (e) {
+      container.querySelector('#sp-officer-table').innerHTML = '';
+      showError(e, 'Officer scores');
+    }
+  })();
+  container.querySelector('#sp-officer-filter').addEventListener('input', paintOfficerTable);
 
-  // --- Ad-hoc group builder ---------------------------------------------------
-  const group = new Map(); // id → officer
+  // --- monthly trend -------------------------------------------------------------
+  (async () => {
+    try {
+      const series = await fetchMonthlySeries(agencyId, 8);
+      container.querySelector('#sp-monthly').innerHTML = renderMonthlyLine(series, { threshold });
+    } catch (e) {
+      container.querySelector('#sp-monthly').innerHTML = '';
+      showError(e, 'Monthly trend');
+    }
+  })();
+
+  // --- ad-hoc group builder --------------------------------------------------------
+  const group = new Map();
   const tagsEl = container.querySelector('#sp-group-tags');
 
   function renderTags() {
     tagsEl.innerHTML = [...group.values()].map((o) => `
-      <span class="pill pill-accent">
+      <span class="pill pill-accent" style="display:inline-flex; align-items:center; gap:4px;">
         ${escHtml(`${o.last_name}, ${o.first_name}`)}
-        <button data-rm="${escAttr(o.id)}" style="background:none;border:none;color:inherit;cursor:pointer;padding:0 0 0 6px;">×</button>
+        <button type="button" data-rm="${escAttr(o.id)}" aria-label="Remove"
+          style="background:none;border:none;color:inherit;cursor:pointer;font-size:14px;line-height:1;padding:2px 4px;">×</button>
       </span>`).join('') || '<span class="text-muted" style="font-size:12px;">Add two or more officers…</span>';
-    tagsEl.querySelectorAll('[data-rm]').forEach((b) =>
-      b.addEventListener('click', () => { group.delete(b.dataset.rm); renderTags(); }));
   }
+  // Event delegation — ONE persistent listener; survives every re-render.
+  // (v5.1 bound per-button listeners that could be lost, making tags undeletable.)
+  tagsEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-rm]');
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    group.delete(btn.dataset.rm);
+    renderTags();
+  });
   renderTags();
 
   new OfficerSearch(container.querySelector('#sp-group-search'), {
@@ -250,26 +365,24 @@ export async function mountScoringPanel(container, { profile, agencyId, threshol
 
   container.querySelector('#sp-group-run').addEventListener('click', async () => {
     const out = container.querySelector('#sp-group-result');
-    if (group.size < 1) { toast('Add at least one officer to the group.', 'error'); return; }
+    if (!group.size) { toast('Add at least one officer to the group.', 'error'); return; }
     out.innerHTML = '<div class="state-block"><div class="spinner"></div></div>';
     try {
       const pkg = await fetchGroupScore([...group.keys()]);
-      out.innerHTML = `
-        <div class="stat-grid">${renderScoreCard(pkg, { title: `Group of ${group.size}`, threshold })}</div>
-        <div style="max-width:480px; margin-top:10px;">${renderDistribution(pkg)}</div>`;
+      out.innerHTML = renderComparisonBars([
+        { label: `Custom Group (${group.size})`, pct: pkg.positive_percentage, color: '#2e9e5b' },
+        agencyPkg ? { label: 'Agency', pct: agencyPkg.positive_percentage, color: '#2f6bd8' } : null,
+        squadPkg ? { label: 'My Squad', pct: squadPkg.positive_percentage, color: '#8a4fc9' } : null,
+      ]) + `<div class="text-muted" style="font-size:11px;">${pkg.positive_reviews} positive / ${pkg.total_reviews} reviews in group</div>`;
     } catch (e) { out.innerHTML = ''; showError(e, 'Group score'); }
   });
 }
 
-// ---------------------------------------------------------------------------
-// Acceptance test — callable from console or a test harness.
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------- acceptance
 export function verifyAcceptanceVector() {
   const input = [
-    { follow_up_outcome: 'no_action' },
-    { follow_up_outcome: 'no_action' },
-    { follow_up_outcome: 'commendation' },
-    { follow_up_outcome: 'training' },
+    { follow_up_outcome: 'no_action' }, { follow_up_outcome: 'no_action' },
+    { follow_up_outcome: 'commendation' }, { follow_up_outcome: 'training' },
     { follow_up_outcome: 'coaching' },
   ];
   const out = computeScorePackage(input);
