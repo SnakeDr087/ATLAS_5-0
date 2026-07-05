@@ -105,8 +105,11 @@ export function renderDonut(pkg, { threshold = 80, size = 150 } = {}) {
   const filled = pct === null ? 0 : (pct / 100) * c;
   return `
     <svg viewBox="0 0 140 140" width="${size}" height="${size}" role="img" aria-label="Performance score donut">
+      <defs><filter id="sp-donut-shadow" x="-25%" y="-25%" width="150%" height="150%">
+        <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#000" flood-opacity="0.3"/>
+      </filter></defs>
       <circle cx="70" cy="70" r="${r}" fill="none" stroke="var(--bg-elevated)" stroke-width="16"/>
-      <circle cx="70" cy="70" r="${r}" fill="none" stroke="${hex}" stroke-width="16"
+      <circle cx="70" cy="70" r="${r}" fill="none" stroke="${hex}" stroke-width="16" filter="url(#sp-donut-shadow)"
               stroke-dasharray="${filled.toFixed(1)} ${c.toFixed(1)}" stroke-linecap="round"
               transform="rotate(-90 70 70)"/>
       <text x="70" y="66" text-anchor="middle" font-size="26" font-weight="700" fill="currentColor">
@@ -117,7 +120,11 @@ export function renderDonut(pkg, { threshold = 80, size = 150 } = {}) {
 }
 
 // Vertical outcome columns
-export function renderOutcomeColumns(pkg, { width = 320, height = 170 } = {}) {
+const OUTCOME_ABBR = {
+  no_action: 'No Act.', commendation: 'Comm.', coaching: 'Coach.',
+  training: 'Train.', internal_affairs: 'IA', pip: 'PIP',
+};
+export function renderOutcomeColumns(pkg, { width = 340, height = 175 } = {}) {
   const codes = Object.keys(OUTCOME_LABELS);
   const max = Math.max(1, ...codes.map((c) => pkg.distribution?.[c] || 0));
   const pad = 24, bw = (width - pad * 2) / codes.length;
@@ -126,14 +133,18 @@ export function renderOutcomeColumns(pkg, { width = 320, height = 170 } = {}) {
     const h = Math.round((n / max) * (height - 55));
     const x = pad + i * bw;
     return `
-      <rect x="${(x + bw * 0.15).toFixed(1)}" y="${height - 35 - h}" width="${(bw * 0.7).toFixed(1)}" height="${h}"
-            rx="3" fill="${OUTCOME_COLORS[code]}"/>
+      <rect x="${(x + bw * 0.18).toFixed(1)}" y="${height - 35 - h}" width="${(bw * 0.64).toFixed(1)}" height="${h}"
+            rx="3" fill="${OUTCOME_COLORS[code]}" filter="url(#sp-shadow)">
+        <title>${escHtml(OUTCOME_LABELS[code])}: ${n}</title></rect>
       <text x="${(x + bw / 2).toFixed(1)}" y="${height - 40 - h}" text-anchor="middle" font-size="10" fill="currentColor">${n || ''}</text>
-      <text x="${(x + bw / 2).toFixed(1)}" y="${height - 22}" text-anchor="middle" font-size="8.5" fill="var(--text-muted)">
-        ${escHtml(OUTCOME_LABELS[code].split(' ')[0])}</text>`;
+      <text x="${(x + bw / 2).toFixed(1)}" y="${height - 20}" text-anchor="middle" font-size="8.5" fill="var(--text-muted)">
+        ${escHtml(OUTCOME_ABBR[code])}</text>`;
   }).join('');
   return `
     <svg viewBox="0 0 ${width} ${height}" style="width:100%; max-width:${width + 60}px;" role="img" aria-label="Outcome distribution">
+      <defs><filter id="sp-shadow" x="-20%" y="-20%" width="140%" height="140%">
+        <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#000" flood-opacity="0.28"/>
+      </filter></defs>
       ${bars}
       <line x1="${pad - 6}" y1="${height - 35}" x2="${width - pad + 6}" y2="${height - 35}" stroke="var(--border)"/>
     </svg>
@@ -164,7 +175,7 @@ export function renderMonthlyLine(series, { width = 560, height = 150, threshold
     <svg viewBox="0 0 ${width} ${height}" style="width:100%;" role="img" aria-label="Monthly performance ratio">
       <line x1="${pad}" y1="${ty}" x2="${width - pad}" y2="${ty}" stroke="var(--warning)" stroke-dasharray="4 4" opacity="0.6"/>
       <text x="${width - pad + 2}" y="${ty}" font-size="8" fill="var(--warning)">${threshold}%</text>
-      <polyline points="${line}" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linejoin="round"/>
+      <polyline points="${line}" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linejoin="round" style="filter: drop-shadow(0 2px 2px rgba(0,0,0,0.25));"/>
       ${dots}${labels}
     </svg>`;
 }
@@ -175,7 +186,7 @@ export function renderMiniBars(distribution, { width = 120, height = 26 } = {}) 
   const max = Math.max(1, ...codes.map((c) => distribution?.[c] || 0));
   const bw = width / codes.length;
   return `
-    <svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="Officer outcome mix">
+    <svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="Officer outcome mix" style="filter: drop-shadow(0 1px 1px rgba(0,0,0,0.2));">
       ${codes.map((code, i) => {
         const n = distribution?.[code] || 0;
         const h = Math.max(n ? 3 : 0, Math.round((n / max) * (height - 4)));
@@ -194,7 +205,7 @@ export function renderComparisonBars(rows) {
         <div style="display:grid; grid-template-columns:130px 1fr 46px; gap:8px; align-items:center; margin-bottom:8px;">
           <span class="text-secondary" style="font-size:12px;">${escHtml(r.label)}</span>
           <div style="background:var(--bg-elevated); border-radius:5px; height:14px; overflow:hidden;">
-            <div style="width:${Math.max(0, Math.min(100, r.pct))}%; height:100%; background:${r.color}; border-radius:5px;"></div>
+            <div style="width:${Math.max(0, Math.min(100, r.pct))}%; height:100%; background:${r.color}; border-radius:5px; box-shadow:0 2px 3px rgba(0,0,0,0.25);"></div>
           </div>
           <strong style="font-size:12px; text-align:right;">${r.pct}%</strong>
         </div>`).join('')}
@@ -209,23 +220,23 @@ export function renderComparisonBars(rows) {
 export async function mountScoringPanel(container, { profile, agencyId, threshold = 80 }) {
   const isSupervisor = profile.role === 'supervisor';
   container.innerHTML = `
-    <div class="card">
+    <div class="card" style="max-width:1240px; margin:0 auto; box-shadow:0 4px 14px rgba(13,23,38,0.10);">
       <h2 class="card-title">Performance Scoring</h2>
       <p class="card-sub" style="margin:4px 0 14px;">
         Positive-outcome ratio: (No Action + Commendation) ÷ total reviews. Whole-number percentage.
       </p>
-      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:24px; align-items:start;">
-        <div style="text-align:center;">
+      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:28px; align-items:start; justify-items:center;">
+        <div style="text-align:center; width:100%; max-width:420px;">
           <div id="sp-donut"><div class="state-block"><div class="spinner"></div></div></div>
           <div style="font-weight:700; font-size:13px; letter-spacing:0.04em;">AGENCY PERFORMANCE SCORE</div>
           <div id="sp-donut-sub" class="text-muted" style="font-size:12px;"></div>
           <div id="sp-squad-line" class="text-secondary" style="font-size:12px; margin-top:4px;"></div>
         </div>
-        <div>
+        <div style="width:100%; max-width:440px;">
           <h3 class="card-title" style="font-size:13px;">Outcome Distribution</h3>
           <div id="sp-columns"></div>
         </div>
-        <div>
+        <div style="width:100%; max-width:440px;">
           <h3 class="card-title" style="font-size:13px;">Individual Officer Score</h3>
           <input id="sp-officer-filter" placeholder="Search officer…" style="width:100%; margin-bottom:8px;"/>
           <div id="sp-officer-table" style="max-height:260px; overflow-y:auto;">
@@ -234,12 +245,12 @@ export async function mountScoringPanel(container, { profile, agencyId, threshol
         </div>
       </div>
 
-      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:24px; margin-top:22px;">
-        <div>
+      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:28px; margin-top:24px; justify-items:center;">
+        <div style="width:100%; max-width:560px;">
           <h3 class="card-title" style="font-size:13px;">Monthly Performance Ratio</h3>
           <div id="sp-monthly"><div class="state-block"><div class="spinner"></div></div></div>
         </div>
-        <div>
+        <div style="width:100%; max-width:440px;">
           <h3 class="card-title" style="font-size:13px;">Group Score (ad-hoc)</h3>
           <div id="sp-group-search"></div>
           <div id="sp-group-tags" style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;"></div>
@@ -355,12 +366,21 @@ export async function mountScoringPanel(container, { profile, agencyId, threshol
   });
   renderTags();
 
-  new OfficerSearch(container.querySelector('#sp-group-search'), {
+  let groupSearch;
+  groupSearch = new OfficerSearch(container.querySelector('#sp-group-search'), {
     agencyId,
     supervisorId: isSupervisor ? profile.id : null,
     activeOnly: false,
     placeholder: 'Add officer to group…',
-    onSelect: (officer) => { if (officer) { group.set(officer.id, officer); renderTags(); } },
+    onSelect: (officer) => {
+      if (!officer) return; // clear() fires onSelect(null) — ignore
+      group.set(officer.id, officer);
+      renderTags();
+      // Reset the component immediately so the input returns and the next
+      // officer can be added — without this the search box disappears after
+      // the first pick and the group can never grow or be edited.
+      groupSearch.clear();
+    },
   });
 
   container.querySelector('#sp-group-run').addEventListener('click', async () => {

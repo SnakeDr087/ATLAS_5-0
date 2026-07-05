@@ -48,6 +48,11 @@
               <label class="field-label">Search officer / case #</label>
               <input type="text" id="f-q" placeholder="Name, badge, ATLAS or police case #" />
             </div>
+            <div><label class="field-label">Date basis</label>
+              <select id="f-basis">
+                <option value="incident_date">Incident date</option>
+                <option value="review_date">Review date</option>
+              </select></div>
             <div><label class="field-label">From</label><input type="date" id="f-from" /></div>
             <div><label class="field-label">To</label><input type="date" id="f-to" /></div>
             <div><label class="field-label">Incident type</label>
@@ -71,7 +76,7 @@
       try {
         // Supervisors: RLS already limits to own reviews / own-roster officers.
         const { data, error } = await supabase.from('bwc_reviews')
-          .select(`id, atlas_case_number, police_case_number, review_date, kpi_score,
+          .select(`id, atlas_case_number, police_case_number, review_date, incident_date, kpi_score,
                    follow_up_outcome, incident_type_id,
                    personnel_roster:primary_officer_id (id, first_name, last_name, badge_number),
                    reviewer:reviewer_id (full_name),
@@ -87,10 +92,10 @@
         return;
       }
 
-      ['f-q', 'f-from', 'f-to', 'f-type', 'f-outcome'].forEach((id) =>
+      ['f-q', 'f-basis', 'f-from', 'f-to', 'f-type', 'f-outcome'].forEach((id) =>
         document.getElementById(id).addEventListener('input', paint));
       document.getElementById('f-clear').addEventListener('click', () => {
-        ['f-q', 'f-from', 'f-to', 'f-type', 'f-outcome'].forEach((id) => (document.getElementById(id).value = ''));
+        ['f-q', 'f-from', 'f-to', 'f-type', 'f-outcome'].forEach((id) => (document.getElementById(id).value = '')); document.getElementById('f-basis').value = 'incident_date';
         paint();
       });
       paint();
@@ -112,8 +117,10 @@
             ].join(' ').toLowerCase();
             if (!hay.includes(q)) return false;
           }
-          if (from && r.review_date < from) return false;
-          if (to && r.review_date > to) return false;
+          const basis = document.getElementById('f-basis').value;
+          const d = r[basis] || r.review_date; // legacy rows without incident_date
+          if (from && d < from) return false;
+          if (to && d > to) return false;
           if (type && r.incident_type_id !== type) return false;
           if (outcome && r.follow_up_outcome !== outcome) return false;
           return true;
@@ -142,7 +149,7 @@
         if (!list.length) { renderEmpty(table, 'No reviews match', 'Adjust the filters, or author a new review.'); return; }
         table.innerHTML = `
           <table class="data">
-            <thead><tr><th>ATLAS #</th><th>Officer</th><th>Incident type</th><th>Reviewer</th><th>Date</th><th>Score</th><th>Outcome</th></tr></thead>
+            <thead><tr><th>ATLAS #</th><th>Officer</th><th>Incident type</th><th>Reviewer</th><th>Incident Date</th><th>Review Date</th><th>Score</th><th>Outcome</th></tr></thead>
             <tbody>
               ${list.map((r) => `
                 <tr class="rowlink" data-id="${escAttr(r.id)}">
@@ -150,6 +157,7 @@
                   <td>${escHtml(r.personnel_roster?.last_name || '')}, ${escHtml(r.personnel_roster?.first_name || '')} <span class="text-muted">#${escHtml(r.personnel_roster?.badge_number || '')}</span></td>
                   <td>${escHtml(r.incident_types?.name || '—')}</td>
                   <td>${escHtml(r.reviewer?.full_name || '—')}</td>
+                  <td>${r.incident_date ? fmtDate(r.incident_date) : '—'}</td>
                   <td>${fmtDate(r.review_date)}</td>
                   <td class="${scoreClass(r.kpi_score, threshold)}">${r.kpi_score ?? '—'}${r.kpi_score !== null ? '%' : ''}</td>
                   <td>${outcomeBadge(r.follow_up_outcome)}</td>
