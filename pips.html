@@ -33,7 +33,7 @@
     if (agencyId) await init();
 
     async function init() {
-      const canCreate = ['internal_affairs', 'training_bureau'].includes(profile.role);
+      const canCreate = ['supervisor', 'internal_affairs', 'training_bureau', 'agency_admin'].includes(profile.role);
       let rows = [];
       try {
         const { data, error } = await supabase.from('pips')
@@ -103,42 +103,141 @@
 
       function openModal() {
         const root = document.getElementById('modal-root');
+        // Step 1: pick officer → the gate evaluates eligibility server-side.
         root.innerHTML = `
           <div class="modal-backdrop">
             <div class="modal">
-              <h2 class="card-title">New Performance Improvement Plan</h2>
+              <h2 class="card-title">Initiate a PIP</h2>
+              <p class="card-sub" style="margin:2px 0 12px;">
+                A PIP requires a documented pattern of prior intervention. Select the officer and ATLAS
+                will check eligibility against the agency standard.
+              </p>
               <div class="form-row"><label class="field-label">Officer *</label><div id="pip-officer"></div></div>
-              <div class="form-grid">
-                <div><label class="field-label">Start date</label><input type="date" id="pip-start" /></div>
-                <div><label class="field-label">End date</label><input type="date" id="pip-end" /></div>
-              </div>
-              <div class="form-row" style="margin-top:14px;"><label class="field-label">Objectives *</label><textarea id="pip-obj"></textarea></div>
-              <div class="flex-between">
+              <div id="gate-result" style="margin-top:14px;"></div>
+              <div class="flex-between" style="margin-top:16px;">
                 <button class="btn btn-secondary" id="pip-cancel">Cancel</button>
-                <button class="btn btn-primary" id="pip-save">Create PIP</button>
+                <button class="btn btn-primary" id="pip-check" disabled>Check Eligibility</button>
               </div>
             </div>
           </div>`;
-        const os = new OfficerSearch(document.getElementById('pip-officer'), { agencyId });
-        document.getElementById('pip-cancel').addEventListener('click', () => (root.innerHTML = ''));
-        document.getElementById('pip-save').addEventListener('click', async () => {
-          const officer = os.getValue();
-          const objectives = document.getElementById('pip-obj').value.trim();
-          if (!officer) return toast('Select an officer.', 'error');
-          if (!objectives) return toast('Objectives are required.', 'error');
-          try {
-            const { data, error } = await supabase.from('pips').insert({
-              agency_id: agencyId, officer_id: officer.id, status: 'draft',
-              start_date: document.getElementById('pip-start').value || null,
-              end_date: document.getElementById('pip-end').value || null,
-              objectives, created_by: profile.id,
-            }).select('id').single();
-            if (error) throw error;
-            await logActivity(profile, 'pip_created', 'pip', data.id, { officer_id: officer.id });
-            toast('PIP created.');
-            location.href = `pip-detail.html?id=${data.id}`;
-          } catch (e) { showError(e, 'Create PIP'); }
+
+        let picked = null;
+        const os = new OfficerSearch(document.getElementById('pip-officer'), {
+          agencyId,
+          supervisorId: profile.role === 'supervisor' ? profile.id : null,
+          onSelect: (o) => {
+            picked = o || null;
+            document.getElementById('pip-check').disabled = !picked;
+            document.getElementById('gate-result').innerHTML = '';
+          },
         });
+        document.getElementById('pip-cancel').addEventListener('click', () => (root.innerHTML = ''));
+        document.getElementById('pip-check').addEventListener('click', () => runGate(picked));
+      }
+
+      async function runGate(officer) {
+        if (!officer) return;
+        const box = document.getElementById('gate-result');
+        renderLoading(box, 'Evaluating against the agency PIP standard…');
+        let verdict;
+        try {
+          const { data, error } = await supabase.rpc('evaluate_pip_eligibility', { p_officer_id: officer.id });
+          if (error) throw error;
+          verdict = data;
+        } catch (e) { box.innerHTML = ''; showError(e, 'Eligibility check'); return; }
+
+        const m = verdict.measured || {};
+        const measuredHtml = `
+          <div class="text-muted" style="font-size:12px; margin-top:8px;">
+            Measured for ${escHtml(officer.last_name)}, ${escHtml(officer.first_name)}:
+            ${m.corrective_outcomes ?? 0}/${m.corrective_required ?? 3} corrective outcomes (${m.lookback_months ?? 12} mo) ·
+            ${m.open_delta_t ?? 0}/${m.open_delta_t_required ?? 2} open Delta T ·
+            ${m.total_reviews ?? 0} total reviews · threshold ${m.threshold ?? 80}%
+          </div>`;
+
+        if (verdict.eligible) {
+          const reasons = (verdict.reasons || []).map((r) => `<li>${escHtml(r.detail)}</li>`).join('');
+          box.innerHTML = `
+            <div class="notice notice-warning">
+              <strong>Pattern established — PIP authorized.</strong>
+              <ul style="margin:6px 0 0 18px;">${reasons}</ul>
+            </div>
+            ${measuredHtml}
+            <div style="margin-top:14px;">
+              <button class="btn btn-primary" id="proceed-pattern">Proceed to PIP Draft →</button>
+            </div>`;
+          document.getElementById('proceed-pattern').addEventListener('click', () =>
+            createDraft(officer, 'pattern', verdict));
+        } else {
+          const missing = `
+            <ul style="margin:6px 0 0 18px;">
+              <li>${m.corrective_outcomes ?? 0} of ${m.corrective_required ?? 3} corrective outcomes in ${m.lookback_months ?? 12} months</li>
+              <li>${m.open_delta_t ?? 0} of ${m.open_delta_t_required ?? 2} open Delta T cases</li>
+              <li>Sustained sub-threshold score not met</li>
+            </ul>`;
+          box.innerHTML = `
+            <div class="notice notice-danger">
+              <strong>Not eligible for a standard PIP.</strong>
+              This officer has not reached the documented-pattern threshold. Consider coaching or a
+              training referral (Delta T) as the appropriate next step.
+              ${missing}
+            </div>
+            ${measuredHtml}
+            ${verdict.allow_egregious_override ? `
+              <div class="card" style="margin-top:14px; border-left:3px solid var(--danger);">
+                <strong style="font-size:13px;">Egregious single-incident override</strong>
+                <p class="text-muted" style="font-size:12px; margin:4px 0 10px;">
+                  For a single incident severe enough to warrant immediate action. Requires written
+                  justification and named higher-authority (Division Commander) approval, recorded on the plan.
+                </p>
+                <label class="field-label">Written justification *</label>
+                <textarea id="egr-justify" rows="3" placeholder="Articulate the severity and why immediate PIP action is warranted…"></textarea>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px;">
+                  <div><label class="field-label">Approver name *</label><input id="egr-name" placeholder="Division Commander name" /></div>
+                  <div><label class="field-label">Approver title *</label><input id="egr-title" placeholder="e.g. Division Commander" /></div>
+                </div>
+                <label class="check-item" style="margin-top:10px;">
+                  <input type="checkbox" id="egr-confirm" /> I confirm the named authority approved this PIP.
+                </label>
+                <div style="margin-top:12px;">
+                  <button class="btn btn-danger" id="proceed-egregious">Proceed with Override →</button>
+                </div>
+              </div>` : ''}`;
+          document.getElementById('proceed-egregious')?.addEventListener('click', () => {
+            const justify = document.getElementById('egr-justify').value.trim();
+            const name = document.getElementById('egr-name').value.trim();
+            const title = document.getElementById('egr-title').value.trim();
+            if (!justify) return toast('Written justification is required for an override.', 'error');
+            if (!name || !title) return toast('Approver name and title are required.', 'error');
+            if (!document.getElementById('egr-confirm').checked) return toast('Confirm the approval.', 'error');
+            createDraft(officer, 'egregious', verdict, { justify, name, title });
+          });
+        }
+      }
+
+      async function createDraft(officer, basis, verdict, override) {
+        try {
+          const today = new Date();
+          const end = new Date(today); end.setDate(end.getDate() + 90); // 90-day default
+          const payload = {
+            agency_id: agencyId, officer_id: officer.id, status: 'draft',
+            start_date: today.toISOString().slice(0, 10),
+            end_date: end.toISOString().slice(0, 10),
+            objectives: '', created_by: profile.id,
+            basis,
+            eligibility_json: verdict,
+            justification: override?.justify || null,
+            approver_name: override?.name || null,
+            approver_title: override?.title || null,
+            approved_at: basis === 'egregious' ? new Date().toISOString() : null,
+          };
+          const { data, error } = await supabase.from('pips').insert(payload).select('id').single();
+          if (error) throw error;
+          await logActivity(profile, 'pip_initiated', 'pip', data.id,
+            { officer_id: officer.id, basis });
+          toast('PIP draft created — build the plan on the next screen.');
+          location.href = `pip-detail.html?id=${data.id}`;
+        } catch (e) { showError(e, 'Create PIP'); }
       }
     }
   </script>
