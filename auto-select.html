@@ -47,6 +47,7 @@
     };
 
     let pool = [], excludedAll = false, incidentTypes = [];
+    let sortBy = 'tier', q = '', showAllReceipts = false; // declared BEFORE the boot try-block calls render()/loadReceipts()
 
     try {
       const cutoff = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
@@ -91,8 +92,6 @@
     } catch (e) {
       if (e.message !== 'empty roster') { showError(e, 'Auto Select'); renderErrorState(content); }
     }
-
-    let sortBy = 'tier', q = '';
 
     function render() {
       const eligible = pool.filter((o) => !o.excluded);
@@ -257,7 +256,6 @@ Method: single draw, uniform random number scaled to cumulative weights (client-
       }
     }
 
-    let showAllReceipts = false;
     async function loadReceipts() {
       const box = document.getElementById('receipts');
       if (!box) return;

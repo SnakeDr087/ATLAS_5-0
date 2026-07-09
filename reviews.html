@@ -93,7 +93,7 @@
       }
 
       ['f-q', 'f-basis', 'f-from', 'f-to', 'f-type', 'f-outcome'].forEach((id) =>
-        document.getElementById(id).addEventListener('input', paint));
+        document.getElementById(id).addEventListener('input', () => { page = 1; paint(); }));
       document.getElementById('f-clear').addEventListener('click', () => {
         ['f-q', 'f-from', 'f-to', 'f-type', 'f-outcome'].forEach((id) => (document.getElementById(id).value = '')); document.getElementById('f-basis').value = 'incident_date';
         paint();
@@ -127,8 +127,14 @@
         });
       }
 
+      let page = 1;
+      const PAGE_SIZE = 20;
+
       function paint() {
         const list = filtered();
+        const pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+        if (page > pages) page = pages;
+        const pageRows = list.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
         // Stat cards + filtered outcome-distribution summary (the Search page's summary, merged).
         const dist = {};
@@ -151,7 +157,7 @@
           <table class="data">
             <thead><tr><th>ATLAS #</th><th>Officer</th><th>Incident type</th><th>Reviewer</th><th>Incident Date</th><th>Review Date</th><th>Score</th><th>Outcome</th></tr></thead>
             <tbody>
-              ${list.map((r) => `
+              ${pageRows.map((r) => `
                 <tr class="rowlink" data-id="${escAttr(r.id)}">
                   <td>${escHtml(r.atlas_case_number)}</td>
                   <td>${escHtml(r.personnel_roster?.last_name || '')}, ${escHtml(r.personnel_roster?.first_name || '')} <span class="text-muted">#${escHtml(r.personnel_roster?.badge_number || '')}</span></td>
@@ -163,7 +169,19 @@
                   <td>${outcomeBadge(r.follow_up_outcome)}</td>
                 </tr>`).join('')}
             </tbody>
-          </table>`;
+          </table>
+          <div class="flex-between" style="margin-top:12px;">
+            <span class="text-muted" style="font-size:12.5px;">
+              Showing ${(page - 1) * PAGE_SIZE + 1}–${Math.min(page * PAGE_SIZE, list.length)} of ${list.length} reviews
+            </span>
+            <span>
+              <button type="button" class="btn btn-secondary btn-sm" id="pg-prev" ${page <= 1 ? 'disabled' : ''}>‹ Prev</button>
+              <span style="font-size:12.5px; margin:0 8px;">Page ${page} of ${pages}</span>
+              <button type="button" class="btn btn-secondary btn-sm" id="pg-next" ${page >= pages ? 'disabled' : ''}>Next ›</button>
+            </span>
+          </div>`;
+        document.getElementById('pg-prev')?.addEventListener('click', () => { page -= 1; paint(); });
+        document.getElementById('pg-next')?.addEventListener('click', () => { page += 1; paint(); });
         table.querySelectorAll('.rowlink').forEach((tr) =>
           tr.addEventListener('click', () => (location.href = `review-detail.html?id=${tr.dataset.id}`)));
       }
