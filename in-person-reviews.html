@@ -5,6 +5,23 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>In-Person Reviews · ATLAS</title>
   <link rel="stylesheet" href="styles.css" />
+  <style>
+    /* Guided-session form */
+    .ipr-script {
+      background: var(--bg-elevated); border-left: 3px solid var(--accent);
+      border-radius: 6px; padding: 10px 14px; font-size: 13px; font-style: italic;
+      color: var(--text-secondary); margin: 6px 0 10px;
+    }
+    .ipr-step { margin-bottom: 22px; }
+    .ipr-step h4 {
+      margin: 0 0 2px; font-family: var(--font-heading); font-size: 13px;
+      text-transform: uppercase; letter-spacing: 0.06em;
+    }
+    .ipr-step .step-hint { font-size: 12px; color: var(--text-muted); margin: 0 0 4px; }
+    .modal.ipr-modal { max-width: 760px; width: 94vw; max-height: 88vh; overflow-y: auto; }
+    .ipr-view dt { font-weight: 600; font-size: 12.5px; margin-top: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+    .ipr-view dd { margin: 4px 0 0; white-space: pre-wrap; }
+  </style>
 </head>
 <body>
   <div class="app">
@@ -16,16 +33,17 @@
   </div>
 
   <script type="module">
-    // NOTE: this page was the home of v4.3's super_admin NULL-agency bug.
-    // It uses requireAgencyContext exactly like every other agency-scoped page
-    // — never profile.agency_id directly.
+    // In-person BWC review sessions: schedule + a guided completion form built
+    // on the agency's andragogy (adult learning) review guide. The officer's
+    // perspective is captured FIRST, then the supervisor's, then the lesson,
+    // then the recap — by design.
     import { bootPage } from './auth.js';
     import { supabase, logActivity } from './supabase-client.js';
     import { requireAgencyContext } from './agency-context.js';
     import { OfficerSearch } from './officer-search.js';
     import {
-      escHtml, escAttr, fmtDate, renderLoading, renderEmpty, renderErrorState,
-      showError, toast,
+      escHtml, escAttr, fmtDate, fmtDateTime, renderLoading, renderEmpty,
+      renderErrorState, showError, toast,
     } from './error-handler.js';
 
     const content = document.getElementById('content');
@@ -35,14 +53,29 @@
     const { agencyId } = await requireAgencyContext(profile, content);
     if (agencyId) await init();
 
+    // The supervisor scripts, verbatim from the agency guide
+    // ("Guide for Conducting In-Person BWC Review Using the Principles of Andragogy").
+    const SCRIPTS = {
+      open: '"Thank you for being here. This review is a chance for us to learn and improve together. Please feel free to share your thoughts and ideas."',
+      self: '"Let\u2019s start by talking about the incident in the video. What do you think went well? What areas would you like to improve?"',
+      decisions: '"Now, let\u2019s talk about the specific issue in the video. Can you explain your thoughts and decisions at that moment? Did you consider any other options?"',
+      experience: '"Based on your past experiences, can you relate this incident to similar situations you\u2019ve dealt with before? How can what you\u2019ve learned help you in the future?"',
+      supervisor: '"I value your perspective. Now, I\u2019ll share my observations. Let\u2019s discuss different viewpoints and learn from each other\u2019s experiences."',
+      lesson: '"Let\u2019s discuss what we can do differently next time. How can we apply what we\u2019ve learned from this review in future situations?" \u2026 "Take a moment to think about how you did overall. What were the strong points of your response? Where could you improve?"',
+      recap: '"As we wrap up, let\u2019s talk about your goals for growth. How can I support you in the areas we\u2019ve identified? Are there any resources or training that would be helpful?"',
+      close: '"Thank you for participating and being open to learning. Remember, our goal is to keep getting better. Feel free to reach out if you have any questions or need more guidance."',
+    };
+
     async function init() {
       const isSupervisor = profile.role === 'supervisor';
+      const canConduct = ['supervisor', 'internal_affairs', 'training_bureau'].includes(profile.role);
       let sessions = [];
       let statusFilter = 'upcoming';
 
       async function loadData() {
         let q = supabase.from('in_person_reviews')
           .select(`id, session_date, topic, notes, completed, created_at,
+                   conducted_date, session_format, form, acknowledged, acknowledged_at,
                    officer:officer_id (id, first_name, last_name, badge_number),
                    supervisor:supervisor_id (full_name)`)
           .eq('agency_id', agencyId)
@@ -70,28 +103,28 @@
         content.innerHTML = `
           <div class="stat-grid">
             <div class="stat"><div class="stat-value">${upcoming.length}</div><div class="stat-label">Upcoming</div></div>
-            <div class="stat ${overdue.length ? 'danger' : ''}"><div class="stat-value">${overdue.length}</div><div class="stat-label">Overdue (not logged)</div></div>
+            <div class="stat ${overdue.length ? 'danger' : ''}"><div class="stat-value">${overdue.length}</div><div class="stat-label">Overdue (not completed)</div></div>
             <div class="stat success"><div class="stat-value">${done.length}</div><div class="stat-label">Completed</div></div>
           </div>
 
-          ${(isSupervisor || ['internal_affairs', 'training_bureau'].includes(profile.role)) ? `
+          ${canConduct ? `
           <div class="card" style="margin-top:20px;">
             <h3 class="card-title">Schedule a Session</h3>
-            <div class="form-grid">
-              <div class="form-row">
-                <div>
-                  <label class="field-label">Officer *</label>
-                  <div id="officer-picker"></div>
-                </div>
-                <div>
-                  <label class="field-label" for="np-date">Session date *</label>
-                  <input type="date" id="np-date" value="${escAttr(todayStr)}" />
-                </div>
+            <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; align-items:end;">
+              <div>
+                <label class="field-label">Officer *</label>
+                <div id="officer-picker"></div>
               </div>
-              <div><label class="field-label" for="np-topic">Topic</label>
-                <input id="np-topic" placeholder="e.g. Quarterly performance sit-down, review of ATL-2026-00042" /></div>
+              <div>
+                <label class="field-label" for="np-date">Session date *</label>
+                <input type="date" id="np-date" value="${escAttr(todayStr)}" />
+              </div>
+              <div>
+                <label class="field-label" for="np-topic">Topic</label>
+                <input id="np-topic" placeholder="e.g. Quarterly BWC review — ATL-2026-00042" />
+              </div>
             </div>
-            <div style="margin-top:12px; text-align:right;">
+            <div style="margin-top:14px; text-align:right;">
               <button class="btn btn-primary" id="btn-schedule">Schedule Session</button>
             </div>
           </div>` : ''}
@@ -110,16 +143,14 @@
           <div id="modal-slot"></div>
         `;
 
-        // Officer picker — the ONE shared OfficerSearch component.
         let selectedOfficer = null;
         const pickerEl = document.getElementById('officer-picker');
         if (pickerEl) {
           new OfficerSearch(pickerEl, {
             agencyId,
-            supervisorId: isSupervisor ? profile.id : null, // supervisor: own roster only
+            supervisorId: isSupervisor ? profile.id : null,
             placeholder: 'Search officer…',
             onSelect: (o) => { selectedOfficer = o; },
-            onClear: () => { selectedOfficer = null; },
           });
         }
 
@@ -169,55 +200,179 @@
                   <div class="text-muted" style="font-size:12px; margin-top:2px;">
                     ${fmtDate(s.session_date)} · ${escHtml(s.supervisor?.full_name || '')}
                     ${s.topic ? ` · ${escHtml(s.topic)}` : ''}
+                    ${s.completed && s.acknowledged ? ' · <span class="pill pill-success" style="font-size:10px;">acknowledged</span>' : ''}
                   </div>
                 </div>
                 <div style="display:flex; gap:6px; align-items:center;">
                   ${s.completed
-                    ? '<span class="pill pill-success">completed</span>'
-                    : (s.session_date < todayStr
+                    ? `<span class="pill pill-success">completed</span>
+                       <button class="btn btn-secondary btn-sm" data-view="${escAttr(s.id)}">View</button>`
+                    : `${s.session_date < todayStr
                         ? '<span class="pill pill-danger">overdue</span>'
-                        : '<span class="pill pill-warning">scheduled</span>')}
-                  ${!s.completed ? `<button class="btn btn-success btn-sm" data-log="${escAttr(s.id)}">Log Session…</button>` : ''}
+                        : '<span class="pill pill-warning">scheduled</span>'}
+                       ${canConduct ? `<button class="btn btn-success btn-sm" data-complete="${escAttr(s.id)}">Complete Session…</button>` : ''}`}
                 </div>
               </div>
-              ${s.notes ? `<p style="margin:10px 0 0; white-space:pre-wrap;">${escHtml(s.notes)}</p>` : ''}
             </div>`).join('');
 
-          el.querySelectorAll('[data-log]').forEach((b) => {
-            b.addEventListener('click', () => openLogModal(sessions.find((x) => x.id === b.dataset.log)));
-          });
+          el.querySelectorAll('[data-complete]').forEach((b) =>
+            b.addEventListener('click', () => openCompleteForm(sessions.find((x) => x.id === b.dataset.complete))));
+          el.querySelectorAll('[data-view]').forEach((b) =>
+            b.addEventListener('click', () => openViewModal(sessions.find((x) => x.id === b.dataset.view))));
         }
       }
 
-      function openLogModal(s) {
+      // ------------------------------------------------------------------
+      // The guided completion form — script cue-cards + capture boxes,
+      // officer's perspective first, then supervisor, then lesson, then recap.
+      // ------------------------------------------------------------------
+      function openCompleteForm(s) {
         const slot = document.getElementById('modal-slot');
+        const todayStr = new Date().toISOString().slice(0, 10);
+        const step = (title, hint, script, inputHtml) => `
+          <div class="ipr-step">
+            <h4>${escHtml(title)}</h4>
+            ${hint ? `<p class="step-hint">${escHtml(hint)}</p>` : ''}
+            ${script ? `<div class="ipr-script">${escHtml(script)}</div>` : ''}
+            ${inputHtml || ''}
+          </div>`;
+        const ta = (id, ph) => `<textarea id="${id}" rows="3" placeholder="${escAttr(ph)}"></textarea>`;
+
         slot.innerHTML = `
           <div class="modal-backdrop">
-            <div class="modal">
-              <h3 class="card-title">Log Session — ${escHtml(s.officer ? `${s.officer.last_name}, ${s.officer.first_name}` : '')}</h3>
-              <div class="form-grid">
-                <div><label class="field-label">Session notes</label>
-                  <textarea id="lg-notes" rows="5" placeholder="What was discussed, agreements made, follow-ups…">${escHtml(s.notes || '')}</textarea></div>
+            <div class="modal ipr-modal">
+              <div class="flex-between">
+                <h3 class="card-title mb-0">Complete In-Person Review — ${escHtml(s.officer ? `${s.officer.last_name}, ${s.officer.first_name}` : '')} <span class="text-muted">#${escHtml(s.officer?.badge_number || '')}</span></h3>
+                <button class="btn btn-secondary btn-sm" id="c-cancel">Cancel</button>
               </div>
-              <div class="flex-between" style="margin-top:16px;">
-                <button class="btn btn-secondary" id="lg-cancel">Cancel</button>
-                <button class="btn btn-success" id="lg-save">Mark Completed</button>
+              <p class="text-muted" style="font-size:12px; margin:4px 0 16px;">
+                Guided form per the agency's adult-learning BWC review guide. Scripts are cues — adapt naturally.
+              </p>
+
+              <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:14px; margin-bottom:18px;">
+                <div><label class="field-label">Date conducted *</label>
+                  <input type="date" id="c-date" value="${escAttr(todayStr)}" /></div>
+                <div><label class="field-label">Format</label>
+                  <select id="c-format">
+                    <option value="in_person">In person</option>
+                    <option value="video">Video</option>
+                    <option value="phone">Phone</option>
+                  </select></div>
+              </div>
+
+              ${step('1 · Preparation', 'Before the session:', null, `
+                <label class="check-item"><input type="checkbox" id="c-prep-video"/> BWC footage watched beforehand</label>
+                <label class="check-item"><input type="checkbox" id="c-prep-notes"/> Key moments noted for discussion</label>
+                <label class="check-item"><input type="checkbox" id="c-prep-docs"/> Relevant reports/documents reviewed</label>`)}
+
+              ${step('2 · Open Supportively', 'Set the tone — no capture needed.', SCRIPTS.open)}
+
+              ${step('3 · Officer\u2019s Perspective — Self-Assessment', 'The officer speaks first.', SCRIPTS.self,
+                ta('c-officer-self', "Officer's own assessment: what went well, what they'd improve…"))}
+
+              ${step('4 · Officer\u2019s Perspective — Decisions in the Moment', null, SCRIPTS.decisions,
+                ta('c-officer-decisions', 'Their thought process at the key moment; alternatives they considered…'))}
+
+              ${step('5 · Connecting Experience', null, SCRIPTS.experience,
+                ta('c-experience', 'How the officer related this to prior incidents; carryover lessons…'))}
+
+              ${step('6 · Supervisor\u2019s Observations', 'Your perspective — after theirs.', SCRIPTS.supervisor,
+                ta('c-supervisor-obs', 'Your observations, points of agreement/difference discussed…'))}
+
+              ${step('7 · The Lesson', null, SCRIPTS.lesson,
+                ta('c-lesson', 'What will be done differently; strengths to keep; areas to work on…'))}
+
+              ${step('8 · Recap — Growth & Support', null, SCRIPTS.recap,
+                ta('c-recap', 'Goals set, support the supervisor will provide, training/resources identified…'))}
+
+              ${step('9 · Positive Close', null, SCRIPTS.close, `
+                <label class="check-item" style="margin-top:6px;">
+                  <input type="checkbox" id="c-ack"/> Officer acknowledged this session
+                </label>`)}
+
+              <div class="flex-between" style="margin-top:8px;">
+                <span class="text-muted" style="font-size:12px;">* Officer perspective, supervisor observations, and the lesson are required.</span>
+                <button class="btn btn-success" id="c-save">Save — Mark Completed</button>
               </div>
             </div>
           </div>`;
-        slot.querySelector('#lg-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
-        slot.querySelector('#lg-save').addEventListener('click', async () => {
+
+        slot.querySelector('#c-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+        slot.querySelector('#c-save').addEventListener('click', async () => {
+          const v = (id) => slot.querySelector('#' + id).value.trim();
+          const ck = (id) => slot.querySelector('#' + id).checked;
+          const officerSelf = v('c-officer-self'), supObs = v('c-supervisor-obs'), lesson = v('c-lesson');
+          if (!v('c-date')) { toast('Enter the date conducted.', 'error'); return; }
+          if (!officerSelf) { toast("Capture the officer's self-assessment first — their perspective leads.", 'error'); return; }
+          if (!supObs) { toast('Capture your observations.', 'error'); return; }
+          if (!lesson) { toast('Capture the lesson — what will be done differently.', 'error'); return; }
+
+          const form = {
+            guide: 'andragogy-bwc-v1',
+            preparation: { footage_watched: ck('c-prep-video'), moments_noted: ck('c-prep-notes'), documents_reviewed: ck('c-prep-docs') },
+            officer_self_assessment: officerSelf,
+            officer_decisions: v('c-officer-decisions'),
+            experience_connection: v('c-experience'),
+            supervisor_observations: supObs,
+            lesson: lesson,
+            recap_growth_support: v('c-recap'),
+          };
+          const acknowledged = ck('c-ack');
           try {
-            const { error } = await supabase.from('in_person_reviews')
-              .update({ completed: true, notes: slot.querySelector('#lg-notes').value.trim() || null })
-              .eq('id', s.id);
+            const { error } = await supabase.from('in_person_reviews').update({
+              completed: true,
+              conducted_date: v('c-date'),
+              session_format: slot.querySelector('#c-format').value,
+              form,
+              acknowledged,
+              acknowledged_at: acknowledged ? new Date().toISOString() : null,
+              notes: lesson, // at-a-glance summary in lists
+            }).eq('id', s.id);
             if (error) throw error;
-            await logActivity(profile, 'in_person_complete', 'in_person_reviews', s.id, {});
-            toast('Session logged.', 'success');
+            await logActivity(profile, 'in_person_complete', 'in_person_reviews', s.id,
+              { officer_id: s.officer?.id, acknowledged });
+            toast('Session completed and recorded.', 'success');
             slot.innerHTML = '';
             refresh();
-          } catch (e) { showError(e, 'Log session'); }
+          } catch (e) { showError(e, 'Complete session'); }
         });
+      }
+
+      // Read-only view of a completed session
+      function openViewModal(s) {
+        const slot = document.getElementById('modal-slot');
+        const f = s.form || {};
+        const row = (label, val) => val ? `<dt>${escHtml(label)}</dt><dd>${escHtml(val)}</dd>` : '';
+        const prep = f.preparation ? ['footage_watched', 'moments_noted', 'documents_reviewed']
+          .filter((k) => f.preparation[k])
+          .map((k) => ({ footage_watched: 'Footage watched', moments_noted: 'Moments noted', documents_reviewed: 'Documents reviewed' }[k]))
+          .join(' · ') : '';
+        slot.innerHTML = `
+          <div class="modal-backdrop">
+            <div class="modal ipr-modal">
+              <div class="flex-between">
+                <h3 class="card-title mb-0">In-Person Review — ${escHtml(s.officer ? `${s.officer.last_name}, ${s.officer.first_name}` : '')}</h3>
+                <button class="btn btn-secondary btn-sm" id="v-close">Close</button>
+              </div>
+              <p class="text-muted" style="font-size:12px; margin:4px 0 8px;">
+                Conducted ${s.conducted_date ? fmtDate(s.conducted_date) : fmtDate(s.session_date)}
+                · ${escHtml((s.session_format || 'in_person').replace('_', ' '))}
+                · by ${escHtml(s.supervisor?.full_name || '')}
+                ${s.acknowledged ? ` · acknowledged ${s.acknowledged_at ? fmtDateTime(s.acknowledged_at) : ''}` : ' · not acknowledged'}
+              </p>
+              <dl class="ipr-view" style="margin:0;">
+                ${row('Preparation', prep)}
+                ${row("Officer's self-assessment", f.officer_self_assessment)}
+                ${row('Officer — decisions in the moment', f.officer_decisions)}
+                ${row('Connecting experience', f.experience_connection)}
+                ${row("Supervisor's observations", f.supervisor_observations)}
+                ${row('The lesson', f.lesson)}
+                ${row('Recap — growth & support', f.recap_growth_support)}
+                ${!s.form ? row('Session notes (legacy)', s.notes) : ''}
+              </dl>
+            </div>
+          </div>`;
+        slot.querySelector('#v-close').addEventListener('click', () => { slot.innerHTML = ''; });
       }
 
       function suffix() {
