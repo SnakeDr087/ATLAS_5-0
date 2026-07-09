@@ -5,6 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PIP Detail · ATLAS</title>
   <link rel="stylesheet" href="styles.css" />
+  <style>
+    .obj-row { border:1px solid var(--border); border-radius:8px; padding:12px 14px; margin-bottom:10px; }
+    .obj-row .obj-head { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .obj-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:8px; }
+    .obj-grid .full { grid-column:1 / -1; }
+    .basis-band { border-left:4px solid var(--accent); background:var(--bg-elevated); border-radius:8px; padding:12px 16px; margin-bottom:16px; }
+    .basis-band.egregious { border-left-color:var(--danger); }
+    .locked-note { font-size:12px; color:var(--text-muted); }
+    @media (max-width:640px){ .obj-grid { grid-template-columns:1fr; } }
+  </style>
 </head>
 <body>
   <div class="app">
@@ -19,7 +29,7 @@
     import { bootPage } from './auth.js';
     import { supabase, logActivity } from './supabase-client.js';
     import {
-      escHtml, escAttr, fmtDate, renderLoading, renderEmpty, renderErrorState,
+      escHtml, escAttr, fmtDate, fmtDateTime, renderLoading, renderEmpty, renderErrorState,
       showError, toast, scoreClass, outcomeBadge,
     } from './error-handler.js';
 
@@ -30,32 +40,42 @@
     const id = new URLSearchParams(location.search).get('id');
     if (!id) { renderEmpty(content, 'No PIP specified'); throw new Error('no id'); }
 
-    const canManage = ['internal_affairs', 'training_bureau'].includes(profile.role);
-    const canGrant = ['internal_affairs', 'training_bureau', 'chief', 'super_admin'].includes(profile.role);
-    let p = null, linked = [], recentReviews = [], accessList = [], agencyUsers = [];
+    // Author roles (build/activate/close the plan). Supervisors author their own.
+    const canManage = ['supervisor', 'internal_affairs', 'training_bureau', 'agency_admin'].includes(profile.role);
+    const canGrant  = ['internal_affairs', 'training_bureau', 'agency_admin', 'chief', 'super_admin'].includes(profile.role);
+
+    const OBJ_STATUS = { pending: 'Pending', in_progress: 'In progress', met: 'Met', not_met: 'Not met' };
+    const OBJ_STATUS_PILL = { pending: 'pill', in_progress: 'pill-warning', met: 'pill-success', not_met: 'pill-danger' };
+
+    let p = null, linked = [], recentReviews = [], accessList = [], agencyUsers = [], openDeltaT = [];
+    // Working copies (draft edits before save)
+    let objectives = [], checkins = [];
 
     await load();
 
     async function load() {
       try {
         const { data, error } = await supabase.from('pips')
-          .select(`*, personnel_roster:officer_id (id, first_name, last_name, badge_number),
+          .select(`*, personnel_roster:officer_id (id, first_name, last_name, badge_number, rank_id, performance_score),
                    creator:created_by (full_name)`)
           .eq('id', id).maybeSingle();
         if (error) throw error;
         if (!data) { renderEmpty(content, 'PIP not found', 'It may not exist or you may not have access to it.'); return; }
         p = data;
+        objectives = Array.isArray(p.objectives_json) ? structuredClone(p.objectives_json) : [];
+        checkins = Array.isArray(p.checkins_json) ? structuredClone(p.checkins_json) : [];
 
-        const [{ data: lr }, { data: rr }, { data: al }, { data: users }] = await Promise.all([
+        const [{ data: lr }, { data: rr }, { data: al }, { data: users }, { data: dt }] = await Promise.all([
           (p.linked_reviews || []).length
             ? supabase.from('bwc_reviews').select('id, atlas_case_number, review_date, kpi_score, follow_up_outcome').in('id', p.linked_reviews)
-            : { data: [] },
+            : Promise.resolve({ data: [] }),
           supabase.from('bwc_reviews').select('id, atlas_case_number, review_date, kpi_score, follow_up_outcome')
             .eq('primary_officer_id', p.officer_id).order('review_date', { ascending: false }).limit(12),
           supabase.from('pip_access_list').select('id, profile_id, profiles:profile_id (full_name, role)').eq('pip_id', id),
-          canGrant ? supabase.from('profiles').select('id, full_name, role').eq('agency_id', p.agency_id).eq('is_active', true).order('full_name') : { data: [] },
+          canGrant ? supabase.from('profiles').select('id, full_name, role').eq('agency_id', p.agency_id).eq('is_active', true).order('full_name') : Promise.resolve({ data: [] }),
+          supabase.from('delta_t_cases').select('id, kpi_id, status, t1_incident_date').eq('officer_id', p.officer_id).eq('status', 'open'),
         ]);
-        linked = lr || []; recentReviews = rr || []; accessList = al || []; agencyUsers = users || [];
+        linked = lr || []; recentReviews = rr || []; accessList = al || []; agencyUsers = users || []; openDeltaT = dt || [];
         render();
       } catch (e) {
         showError(e, 'PIP detail');
@@ -63,99 +83,358 @@
       }
     }
 
-    function render() {
-      const pill = (s) => s === 'active' ? 'pill-warning' : s === 'completed' ? 'pill-success' : s === 'terminated' ? 'pill-danger' : 'pill';
-      const linkedIds = new Set(linked.map((r) => r.id));
-      const linkable = recentReviews.filter((r) => !linkedIds.has(r.id));
-      const grantable = agencyUsers.filter((u) => !accessList.some((a) => a.profile_id === u.id));
+    function statusPill(s) {
+      return s === 'active' ? 'pill-warning' : s === 'completed' ? 'pill-success' : s === 'terminated' ? 'pill-danger' : 'pill';
+    }
 
+    // Locked once active/closed: only check-ins, objective status, acknowledgment, and closure remain editable.
+    function isEditable() { return canManage && p.status === 'draft'; }
+    function isActive() { return p.status === 'active'; }
+    function isClosed() { return p.status === 'completed' || p.status === 'terminated'; }
+    function pastDue() { return isActive() && p.end_date && p.end_date < new Date().toISOString().slice(0, 10); }
+
+    function render() {
+      const o = p.personnel_roster || {};
       const reviewRow = (r, action = '') => `
         <div class="kpi-row">
           <span class="kpi-text"><a href="review-detail.html?id=${escAttr(r.id)}">${escHtml(r.atlas_case_number)}</a>
             · ${fmtDate(r.review_date)} · <span class="${scoreClass(r.kpi_score)}">${r.kpi_score ?? '—'}%</span> ${outcomeBadge(r.follow_up_outcome)}</span>
           ${action}
         </div>`;
+      const linkedIds = new Set(linked.map((r) => r.id));
+      const linkable = recentReviews.filter((r) => !linkedIds.has(r.id));
+      const grantable = agencyUsers.filter((u) => !accessList.some((a) => a.profile_id === u.id));
+      const ed = isEditable();
+
+      // ---- basis / justification band (the receipt of record) --------------
+      const reasons = (p.eligibility_json?.reasons || []).map((r) => `<li>${escHtml(r.detail)}</li>`).join('');
+      const basisBand = p.basis === 'egregious'
+        ? `<div class="basis-band egregious">
+             <strong>Egregious single-incident override</strong>
+             <div style="margin-top:6px; font-size:13px;">${escHtml(p.justification || '')}</div>
+             <div class="text-muted" style="font-size:12px; margin-top:8px;">
+               Approved by ${escHtml(p.approver_name || '—')}${p.approver_title ? ', ' + escHtml(p.approver_title) : ''}
+               ${p.approved_at ? ' · ' + fmtDateTime(p.approved_at) : ''}
+             </div>
+           </div>`
+        : p.basis === 'pattern'
+          ? `<div class="basis-band">
+               <strong>Pattern established — PIP authorized under the agency standard</strong>
+               <ul style="margin:6px 0 0 18px; font-size:13px;">${reasons || '<li>Qualifying history on file.</li>'}</ul>
+             </div>`
+          : '';
 
       content.innerHTML = `
         <div class="flex-between" style="margin-bottom:16px;">
-          <h2 style="margin:0;">PIP — ${escHtml(p.personnel_roster?.last_name || '')}, ${escHtml(p.personnel_roster?.first_name || '')} <span class="text-muted">#${escHtml(p.personnel_roster?.badge_number || '')}</span></h2>
-          <span><span class="pill ${pill(p.status)}">${escHtml(p.status)}</span>
-          <a class="btn btn-secondary btn-sm" href="pips.html">← All PIPs</a></span>
+          <h2 style="margin:0;">PIP — ${escHtml(o.last_name || '')}, ${escHtml(o.first_name || '')} <span class="text-muted">#${escHtml(o.badge_number || '')}</span></h2>
+          <span>
+            <span class="pill ${statusPill(p.status)}">${escHtml(p.status)}</span>
+            ${pastDue() ? '<span class="pill pill-danger">past due</span>' : ''}
+            <a class="btn btn-secondary btn-sm" href="pips.html">← All PIPs</a>
+          </span>
         </div>
 
+        ${basisBand}
+
         <div class="card">
-          <h2 class="card-title">Plan</h2>
-          <div class="detail-grid" style="margin-bottom:14px;">
+          <div class="detail-grid" style="margin-bottom:6px;">
             <div class="detail-item"><div class="dl">Start</div><div class="dv">${fmtDate(p.start_date)}</div></div>
-            <div class="detail-item"><div class="dl">End</div><div class="dv">${fmtDate(p.end_date)}</div></div>
+            <div class="detail-item"><div class="dl">End (90-day default)</div><div class="dv">${fmtDate(p.end_date)}</div></div>
             <div class="detail-item"><div class="dl">Created by</div><div class="dv">${escHtml(p.creator?.full_name || '—')}</div></div>
-            <div class="detail-item"><div class="dl">Officer profile</div><div class="dv"><a href="officer-profile.html?id=${escAttr(p.personnel_roster?.id || '')}">View →</a></div></div>
+            <div class="detail-item"><div class="dl">Score at start</div><div class="dv">${p.score_at_start != null ? `<span class="${scoreClass(p.score_at_start)}">${p.score_at_start}%</span>` : '<span class="text-muted">— (stamped on activation)</span>'}</div></div>
+            <div class="detail-item"><div class="dl">Current score</div><div class="dv"><span class="${scoreClass(o.performance_score)}">${o.performance_score ?? '—'}${o.performance_score != null ? '%' : ''}</span></div></div>
+            <div class="detail-item"><div class="dl">Officer profile</div><div class="dv"><a href="officer-profile.html?officer_id=${escAttr(o.id || '')}">View →</a></div></div>
           </div>
-          <label class="field-label">Objectives</label>
-          ${canManage
-            ? `<textarea id="f-obj">${escHtml(p.objectives || '')}</textarea>`
-            : `<p style="white-space:pre-wrap;">${escHtml(p.objectives || '—')}</p>`}
-          ${canManage ? `
-            <div class="form-grid" style="margin-top:12px;align-items:end;">
-              <div><label class="field-label">Status</label>
-                <select id="f-status">${['draft','active','completed','terminated'].map((s) => `<option value="${s}"${s === p.status ? ' selected' : ''}>${escHtml(s)}</option>`).join('')}</select></div>
-              <div><label class="field-label">Start</label><input type="date" id="f-start" value="${escAttr(p.start_date || '')}" /></div>
-              <div><label class="field-label">End</label><input type="date" id="f-end" value="${escAttr(p.end_date || '')}" /></div>
-              <div><button class="btn btn-primary" id="save-btn">Save changes</button></div>
+          ${ed ? '' : `<p class="locked-note">${isClosed() ? 'This PIP is closed and read-only.' : isActive() ? 'This PIP is active — the plan is locked. You can log check-ins, update objective status, record acknowledgment, and close it out.' : ''}</p>`}
+        </div>
+
+        <!-- PURPOSE -->
+        <div class="card">
+          <h2 class="card-title">Purpose</h2>
+          ${ed
+            ? `<textarea id="f-purpose" rows="3" placeholder="What triggered this PIP and the area(s) impacted…">${escHtml(p.purpose || '')}</textarea>`
+            : `<p style="white-space:pre-wrap;">${escHtml(p.purpose || '—')}</p>`}
+        </div>
+
+        <!-- OBJECTIVES -->
+        <div class="card">
+          <div class="flex-between"><h2 class="card-title mb-0">Areas of Improvement &amp; Objectives</h2>
+            ${ed ? '<button class="btn btn-secondary btn-sm" id="add-obj">+ Add objective</button>' : ''}</div>
+          <div id="obj-list" style="margin-top:12px;"></div>
+        </div>
+
+        <!-- SUPPORT -->
+        <div class="card">
+          <h2 class="card-title">Support &amp; Resources</h2>
+          <div class="obj-grid">
+            <div class="full"><label class="field-label">Training &amp; development</label>
+              ${ed ? `<textarea id="f-training" rows="2">${escHtml(p.support_training || '')}</textarea>` : `<p style="white-space:pre-wrap;">${escHtml(p.support_training || '—')}</p>`}</div>
+            <div><label class="field-label">Mentor / coach</label>
+              ${ed ? `<input id="f-mentor" value="${escAttr(p.support_mentor || '')}" />` : `<p>${escHtml(p.support_mentor || '—')}</p>`}</div>
+            <div><label class="field-label">Tools / resources</label>
+              ${ed ? `<input id="f-tools" value="${escAttr(p.support_tools || '')}" />` : `<p>${escHtml(p.support_tools || '—')}</p>`}</div>
+          </div>
+        </div>
+
+        <!-- CHECK-INS -->
+        <div class="card">
+          <h2 class="card-title">Check-In Schedule</h2>
+          <div style="margin-bottom:10px;">
+            <label class="field-label">Planned cadence</label>
+            ${ed ? `<input id="f-cadence" value="${escAttr(p.checkin_cadence || '')}" placeholder="e.g. Biweekly, then final review at end date" />`
+                 : `<p>${escHtml(p.checkin_cadence || '—')}</p>`}
+          </div>
+          <div id="checkin-list"></div>
+          ${(isActive() && canManage) ? `
+            <div class="obj-grid" style="align-items:end; margin-top:10px;">
+              <div><label class="field-label">Check-in date</label><input type="date" id="ci-date" value="${escAttr(new Date().toISOString().slice(0,10))}" /></div>
+              <div><label class="field-label">On track?</label>
+                <select id="ci-track"><option value="true">On track</option><option value="false">Off track</option></select></div>
+              <div class="full"><label class="field-label">Progress notes</label><textarea id="ci-notes" rows="2"></textarea></div>
+              <div class="full"><button class="btn btn-primary btn-sm" id="ci-add">Log check-in</button></div>
             </div>` : ''}
         </div>
 
+        <!-- LINKED EVIDENCE -->
         <div class="card">
-          <h2 class="card-title">Linked reviews</h2>
-          ${linked.map((r) => reviewRow(r, canManage ? `<button class="btn btn-secondary btn-sm unlink-btn" data-id="${escAttr(r.id)}">Unlink</button>` : '')).join('') || '<p class="text-muted">No reviews linked to this plan yet.</p>'}
+          <h2 class="card-title">Linked Reviews &amp; Delta T Evidence</h2>
+          ${openDeltaT.length ? `<p class="text-muted" style="font-size:12.5px;">${openDeltaT.length} open Delta T case(s) on this officer — part of the documented pattern.</p>` : ''}
+          ${linked.map((r) => reviewRow(r, (ed || isActive()) && canManage ? `<button class="btn btn-secondary btn-sm unlink-btn" data-id="${escAttr(r.id)}">Unlink</button>` : '')).join('') || '<p class="text-muted">No reviews linked yet.</p>'}
           ${canManage && linkable.length ? `
-            <h3 style="margin:16px 0 6px;">Officer's recent reviews — link as evidence</h3>
+            <h3 style="margin:16px 0 6px; font-size:13px;">Officer's recent reviews — link as evidence</h3>
             ${linkable.map((r) => reviewRow(r, `<button class="btn btn-secondary btn-sm link-btn" data-id="${escAttr(r.id)}">Link</button>`)).join('')}` : ''}
         </div>
 
+        <!-- ACKNOWLEDGMENT -->
         <div class="card">
-          <h2 class="card-title">Named access grants</h2>
+          <h2 class="card-title">Acknowledgment</h2>
+          <label class="check-item">
+            <input type="checkbox" id="ack-officer" ${p.officer_ack ? 'checked' : ''} ${(!canManage || isClosed()) ? 'disabled' : ''}/>
+            Officer acknowledged this PIP ${p.officer_ack_at ? `<span class="text-muted">· ${fmtDateTime(p.officer_ack_at)}</span>` : ''}
+          </label>
+          <label class="check-item">
+            <input type="checkbox" id="ack-supervisor" ${p.supervisor_ack ? 'checked' : ''} ${(!canManage || isClosed()) ? 'disabled' : ''}/>
+            Supervisor attestation ${p.supervisor_ack_at ? `<span class="text-muted">· ${fmtDateTime(p.supervisor_ack_at)}</span>` : ''}
+          </label>
+          ${(canManage && !isClosed()) ? '<div style="margin-top:8px;"><button class="btn btn-secondary btn-sm" id="ack-save">Save acknowledgment</button></div>' : ''}
+        </div>
+
+        <!-- STATUS / LIFECYCLE -->
+        ${canManage ? `
+        <div class="card">
+          <h2 class="card-title">Plan Status</h2>
+          ${p.status === 'draft' ? `
+            <p class="text-muted" style="font-size:13px;">Activating locks the plan and stamps the officer's current score as the baseline.</p>
+            <button class="btn btn-primary" id="btn-activate">Activate PIP</button>
+            <button class="btn btn-secondary" id="btn-save-draft" style="margin-left:8px;">Save draft</button>` : ''}
+          ${isActive() ? `
+            <label class="field-label">Outcome summary (required to close)</label>
+            <textarea id="f-outcome" rows="3" placeholder="Objectives met and returned to standard supervision / not met and referred to…"></textarea>
+            <div style="margin-top:10px;">
+              <button class="btn btn-success" id="btn-complete">Complete (objectives met)</button>
+              <button class="btn btn-danger" id="btn-terminate" style="margin-left:8px;">Terminate (not met)</button>
+            </div>` : ''}
+          ${isClosed() ? `
+            <div class="detail-item"><div class="dl">Outcome</div><div class="dv" style="white-space:pre-wrap;">${escHtml(p.outcome_summary || '—')}</div></div>
+            <div class="text-muted" style="font-size:12px; margin-top:6px;">Closed ${p.closed_at ? fmtDateTime(p.closed_at) : ''}</div>` : ''}
+        </div>` : ''}
+
+        <!-- ACCESS -->
+        <div class="card">
+          <h2 class="card-title">Named Access Grants</h2>
+          <p class="text-muted" style="font-size:12px;">PIPs are deny-by-default. These grants read-in specific people beyond role defaults.</p>
           ${accessList.map((a) => `
             <div class="kpi-row">
               <span class="kpi-text">${escHtml(a.profiles?.full_name || '—')} <span class="pill">${escHtml(a.profiles?.role || '')}</span></span>
               ${canGrant ? `<button class="btn btn-danger btn-sm revoke-btn" data-id="${escAttr(a.id)}">Revoke</button>` : ''}
             </div>`).join('') || '<p class="text-muted">No named grants — role defaults only.</p>'}
           ${canGrant && grantable.length ? `
-            <div class="form-grid" style="margin-top:14px;align-items:end;">
-              <div><label class="field-label">Grant access to</label>
+            <div class="obj-grid" style="align-items:end; margin-top:14px;">
+              <div class="full"><label class="field-label">Grant access to</label>
                 <select id="f-grant">${grantable.map((u) => `<option value="${escAttr(u.id)}">${escHtml(u.full_name)} (${escHtml(u.role)})</option>`).join('')}</select></div>
-              <div><button class="btn btn-primary" id="grant-btn">Grant access</button></div>
+              <div class="full"><button class="btn btn-primary btn-sm" id="grant-btn">Grant access</button></div>
             </div>` : ''}
         </div>`;
 
-      document.getElementById('save-btn')?.addEventListener('click', save);
+      paintObjectives();
+      paintCheckins();
+      wire();
+    }
+
+    function paintObjectives() {
+      const el = document.getElementById('obj-list');
+      const ed = isEditable();
+      if (!objectives.length) {
+        el.innerHTML = '<p class="text-muted">No objectives yet.' + (ed ? ' Add at least one before activating.' : '') + '</p>';
+        return;
+      }
+      el.innerHTML = objectives.map((ob, i) => `
+        <div class="obj-row">
+          <div class="obj-head">
+            <strong>Objective ${i + 1}</strong>
+            <span style="display:flex; gap:6px; align-items:center;">
+              ${(isActive() && canManage) ? `
+                <select data-objstatus="${i}" class="obj-status-sel">
+                  ${Object.entries(OBJ_STATUS).map(([k, v]) => `<option value="${k}"${ob.status === k ? ' selected' : ''}>${v}</option>`).join('')}
+                </select>`
+                : `<span class="pill ${OBJ_STATUS_PILL[ob.status] || 'pill'}">${OBJ_STATUS[ob.status] || 'pending'}</span>`}
+              ${ed ? `<button class="btn btn-danger btn-sm" data-delobj="${i}">×</button>` : ''}
+            </span>
+          </div>
+          ${ed ? `
+            <div class="obj-grid">
+              <div class="full"><label class="field-label">Area of improvement + examples</label>
+                <textarea data-obj="${i}" data-field="area" rows="2">${escHtml(ob.area || '')}</textarea></div>
+              <div class="full"><label class="field-label">Expected outcome</label>
+                <input data-obj="${i}" data-field="expected" value="${escAttr(ob.expected || '')}" /></div>
+              <div><label class="field-label">Success metric</label>
+                <input data-obj="${i}" data-field="metric" value="${escAttr(ob.metric || '')}" /></div>
+              <div><label class="field-label">Target date</label>
+                <input type="date" data-obj="${i}" data-field="target_date" value="${escAttr(ob.target_date || '')}" /></div>
+            </div>`
+          : `
+            <div style="font-size:13px; margin-top:4px;">
+              <div><strong>Area:</strong> ${escHtml(ob.area || '—')}</div>
+              <div><strong>Expected:</strong> ${escHtml(ob.expected || '—')}</div>
+              <div><strong>Metric:</strong> ${escHtml(ob.metric || '—')} · <strong>Target:</strong> ${ob.target_date ? fmtDate(ob.target_date) : '—'}</div>
+            </div>`}
+        </div>`).join('');
+
+      // wire edit inputs
+      el.querySelectorAll('[data-obj]').forEach((inp) => {
+        inp.addEventListener('input', () => {
+          objectives[+inp.dataset.obj][inp.dataset.field] = inp.value;
+        });
+      });
+      el.querySelectorAll('[data-delobj]').forEach((b) =>
+        b.addEventListener('click', () => { objectives.splice(+b.dataset.delobj, 1); paintObjectives(); }));
+      el.querySelectorAll('[data-objstatus]').forEach((sel) =>
+        sel.addEventListener('change', () => updateObjStatus(+sel.dataset.objstatus, sel.value)));
+    }
+
+    function paintCheckins() {
+      const el = document.getElementById('checkin-list');
+      if (!el) return;
+      if (!checkins.length) { el.innerHTML = '<p class="text-muted" style="font-size:12.5px;">No check-ins logged yet.</p>'; return; }
+      el.innerHTML = checkins.map((c) => `
+        <div class="kpi-row">
+          <span class="kpi-text">${fmtDate(c.date)} · <span class="pill ${c.on_track ? 'pill-success' : 'pill-danger'}">${c.on_track ? 'on track' : 'off track'}</span>
+            ${c.notes ? '· ' + escHtml(c.notes) : ''}</span>
+        </div>`).join('');
+    }
+
+    function wire() {
+      document.getElementById('add-obj')?.addEventListener('click', () => {
+        objectives.push({ area: '', expected: '', metric: '', target_date: '', status: 'pending' });
+        paintObjectives();
+      });
+      document.getElementById('btn-save-draft')?.addEventListener('click', saveDraft);
+      document.getElementById('btn-activate')?.addEventListener('click', activate);
+      document.getElementById('btn-complete')?.addEventListener('click', () => close('completed'));
+      document.getElementById('btn-terminate')?.addEventListener('click', () => close('terminated'));
+      document.getElementById('ci-add')?.addEventListener('click', addCheckin);
+      document.getElementById('ack-save')?.addEventListener('click', saveAck);
       document.getElementById('grant-btn')?.addEventListener('click', grant);
       content.querySelectorAll('.link-btn').forEach((b) => b.addEventListener('click', () => linkReview(b.dataset.id, true)));
       content.querySelectorAll('.unlink-btn').forEach((b) => b.addEventListener('click', () => linkReview(b.dataset.id, false)));
       content.querySelectorAll('.revoke-btn').forEach((b) => b.addEventListener('click', () => revoke(b.dataset.id)));
     }
 
-    async function save() {
+    function collectDraft() {
+      return {
+        purpose: document.getElementById('f-purpose')?.value.trim() || null,
+        objectives_json: objectives,
+        support_training: document.getElementById('f-training')?.value.trim() || null,
+        support_mentor: document.getElementById('f-mentor')?.value.trim() || null,
+        support_tools: document.getElementById('f-tools')?.value.trim() || null,
+        checkin_cadence: document.getElementById('f-cadence')?.value.trim() || null,
+      };
+    }
+
+    async function saveDraft() {
+      try {
+        const { error } = await supabase.from('pips').update(collectDraft()).eq('id', p.id);
+        if (error) throw error;
+        await logActivity(profile, 'pip_draft_saved', 'pip', p.id);
+        toast('Draft saved.');
+        await load();
+      } catch (e) { showError(e, 'Save draft'); }
+    }
+
+    async function activate() {
+      if (!objectives.length) return toast('Add at least one objective before activating.', 'error');
+      if (objectives.some((o) => !(o.area || '').trim())) return toast('Every objective needs an area of improvement.', 'error');
       try {
         const update = {
-          status: document.getElementById('f-status').value,
-          start_date: document.getElementById('f-start').value || null,
-          end_date: document.getElementById('f-end').value || null,
-          objectives: document.getElementById('f-obj').value.trim(),
+          ...collectDraft(),
+          status: 'active',
+          activated_at: new Date().toISOString(),
+          score_at_start: p.personnel_roster?.performance_score ?? null,
         };
         const { error } = await supabase.from('pips').update(update).eq('id', p.id);
         if (error) throw error;
-        await logActivity(profile, 'pip_updated', 'pip', p.id, { status: update.status });
-        toast('PIP saved.');
+        await logActivity(profile, 'pip_activated', 'pip', p.id, { score_at_start: update.score_at_start });
+        toast('PIP activated — plan locked, baseline score stamped.');
         await load();
-      } catch (e) { showError(e, 'Save PIP'); }
+      } catch (e) { showError(e, 'Activate PIP'); }
+    }
+
+    async function updateObjStatus(i, status) {
+      objectives[i].status = status;
+      try {
+        const { error } = await supabase.from('pips').update({ objectives_json: objectives }).eq('id', p.id);
+        if (error) throw error;
+      } catch (e) { showError(e, 'Update objective'); }
+    }
+
+    async function addCheckin() {
+      const date = document.getElementById('ci-date').value;
+      const notes = document.getElementById('ci-notes').value.trim();
+      if (!date) return toast('Pick a check-in date.', 'error');
+      checkins = [{ date, on_track: document.getElementById('ci-track').value === 'true', notes }, ...checkins];
+      try {
+        const { error } = await supabase.from('pips').update({ checkins_json: checkins }).eq('id', p.id);
+        if (error) throw error;
+        await logActivity(profile, 'pip_checkin', 'pip', p.id, { date });
+        toast('Check-in logged.');
+        await load();
+      } catch (e) { showError(e, 'Log check-in'); }
+    }
+
+    async function saveAck() {
+      const off = document.getElementById('ack-officer').checked;
+      const sup = document.getElementById('ack-supervisor').checked;
+      try {
+        const { error } = await supabase.from('pips').update({
+          officer_ack: off,
+          officer_ack_at: off ? (p.officer_ack_at || new Date().toISOString()) : null,
+          supervisor_ack: sup,
+          supervisor_ack_at: sup ? (p.supervisor_ack_at || new Date().toISOString()) : null,
+        }).eq('id', p.id);
+        if (error) throw error;
+        await logActivity(profile, 'pip_acknowledged', 'pip', p.id, { officer: off, supervisor: sup });
+        toast('Acknowledgment saved.');
+        await load();
+      } catch (e) { showError(e, 'Save acknowledgment'); }
+    }
+
+    async function close(status) {
+      const summary = document.getElementById('f-outcome').value.trim();
+      if (!summary) return toast('An outcome summary is required to close a PIP.', 'error');
+      try {
+        const { error } = await supabase.from('pips').update({
+          status, outcome_summary: summary, closed_at: new Date().toISOString(),
+        }).eq('id', p.id);
+        if (error) throw error;
+        await logActivity(profile, 'pip_closed', 'pip', p.id, { status });
+        toast(`PIP ${status}.`);
+        await load();
+      } catch (e) { showError(e, 'Close PIP'); }
     }
 
     async function linkReview(reviewId, add) {
       try {
-        const next = add
-          ? [...(p.linked_reviews || []), reviewId]
-          : (p.linked_reviews || []).filter((r) => r !== reviewId);
+        const next = add ? [...(p.linked_reviews || []), reviewId] : (p.linked_reviews || []).filter((r) => r !== reviewId);
         const { error } = await supabase.from('pips').update({ linked_reviews: next }).eq('id', p.id);
         if (error) throw error;
         await logActivity(profile, add ? 'pip_review_linked' : 'pip_review_unlinked', 'pip', p.id, { review: reviewId });
