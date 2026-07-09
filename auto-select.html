@@ -92,44 +92,108 @@
       if (e.message !== 'empty roster') { showError(e, 'Auto Select'); renderErrorState(content); }
     }
 
+    let sortBy = 'tier', q = '';
+
     function render() {
       const eligible = pool.filter((o) => !o.excluded);
+      const excluded = pool.filter((o) => o.excluded);
       const totalWeight = eligible.reduce((s, o) => s + o.weight, 0);
-      const tierPill = { critical: 'pill-danger', elevated: 'pill-warning', standard: 'pill-success' };
 
       content.innerHTML = `
         ${excludedAll ? `<div class="notice notice-warning" style="margin-bottom:16px;">Every officer on your roster was reviewed within the last 30 days — the exclusion window has reset and all officers are eligible again.</div>` : ''}
         <div class="card" style="border-left:4px solid var(--accent);">
-          <div class="flex-between">
-            <div>
-              <h2 class="card-title mb-0">Selection pool</h2>
-              <p class="card-sub" style="margin:4px 0 0;">${eligible.length} eligible of ${pool.length} · total weight ${totalWeight} · officers reviewed in the last 30 days are excluded.</p>
+          <div class="flex-between" style="flex-wrap:wrap;gap:10px;">
+            <div class="stat-grid mb-0" style="flex:1;min-width:300px;">
+              <div class="stat"><div class="stat-value">${pool.length}</div><div class="stat-label">On roster</div></div>
+              <div class="stat success"><div class="stat-value">${eligible.length}</div><div class="stat-label">Eligible</div></div>
+              <div class="stat ${excluded.length ? 'warning' : ''}"><div class="stat-value">${excluded.length}</div><div class="stat-label">Excluded (30-day)</div></div>
+              <div class="stat"><div class="stat-value">${totalWeight}</div><div class="stat-label">Total weight</div></div>
             </div>
             <button class="btn btn-primary" id="run-btn" ${eligible.length ? '' : 'disabled'}>Run Auto Select</button>
           </div>
         </div>
         <div id="result"></div>
-        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-bottom:22px;">
-          ${pool.map((o) => `
-            <div class="card mb-0" style="padding:14px 16px;${o.excluded ? 'opacity:.5;' : ''}">
-              <div class="flex-between">
-                <strong>${escHtml(o.last_name)}, ${escHtml(o.first_name)}</strong>
-                <span class="pill ${tierPill[o.tier]}">${escHtml(o.tier)}</span>
-              </div>
-              <div class="text-muted" style="font-size:12.5px;margin:4px 0 8px;">#${escHtml(o.badge_number || '—')} · ${escHtml(o.agency_ranks?.rank_name || 'Unranked')}</div>
-              <div class="flex-between" style="font-size:13px;">
-                <span>Score <span class="${scoreClass(o.performance_score)}">${o.performance_score ?? '—'}${o.performance_score !== null ? '%' : ''}</span> · ${o.reviewCount} reviews</span>
-                <span class="pill pill-accent">${o.weight}× weight</span>
-              </div>
-              ${o.excluded ? '<div class="pill" style="margin-top:8px;">excluded — reviewed &lt; 30 days ago</div>' : ''}
-            </div>`).join('')}
+
+        <div class="card">
+          <div class="flex-between" style="flex-wrap:wrap;gap:10px;">
+            <h2 class="card-title mb-0">Selection pool</h2>
+            <div class="filter-bar" style="margin:0;">
+              <input id="pool-q" placeholder="Search officer…" value="${escAttr(q)}" style="width:180px;"/>
+              <select id="pool-sort">
+                <option value="tier" ${sortBy === 'tier' ? 'selected' : ''}>Sort: tier (highest weight)</option>
+                <option value="score" ${sortBy === 'score' ? 'selected' : ''}>Sort: score (lowest first)</option>
+                <option value="name" ${sortBy === 'name' ? 'selected' : ''}>Sort: name</option>
+                <option value="reviews" ${sortBy === 'reviews' ? 'selected' : ''}>Sort: review count</option>
+              </select>
+            </div>
+          </div>
+          <div id="pool-table" style="margin-top:10px;"></div>
         </div>
+
         <div class="card">
           <h2 class="card-title">Past selection receipts <span class="pill">permanent audit trail</span></h2>
           <div id="receipts"></div>
         </div>`;
 
       document.getElementById('run-btn')?.addEventListener('click', run);
+      document.getElementById('pool-q').addEventListener('input', (e) => { q = e.target.value; paintPool(); });
+      document.getElementById('pool-sort').addEventListener('change', (e) => { sortBy = e.target.value; paintPool(); });
+      paintPool();
+    }
+
+    function paintPool() {
+      const el = document.getElementById('pool-table');
+      const tierPill = { critical: 'pill-danger', elevated: 'pill-warning', standard: 'pill-success' };
+      const tierRank = { critical: 0, elevated: 1, standard: 2 };
+      const needle = q.trim().toLowerCase();
+
+      const match = (o) => !needle ||
+        `${o.first_name} ${o.last_name} ${o.badge_number || ''}`.toLowerCase().includes(needle);
+      const sorters = {
+        tier: (a, b) => tierRank[a.tier] - tierRank[b.tier] || (a.performance_score ?? 999) - (b.performance_score ?? 999),
+        score: (a, b) => (a.performance_score ?? 999) - (b.performance_score ?? 999),
+        name: (a, b) => `${a.last_name} ${a.first_name}`.localeCompare(`${b.last_name} ${b.first_name}`),
+        reviews: (a, b) => b.reviewCount - a.reviewCount,
+      };
+
+      const eligible = pool.filter((o) => !o.excluded && match(o)).sort(sorters[sortBy]);
+      const excluded = pool.filter((o) => o.excluded && match(o)).sort(sorters[sortBy]);
+
+      const row = (o) => `
+        <tr ${o.excluded ? 'style="opacity:.55;"' : ''}>
+          <td><strong>${escHtml(o.last_name)}, ${escHtml(o.first_name)}</strong>
+            <span class="text-muted">#${escHtml(o.badge_number || '—')}</span>
+            <div class="text-muted" style="font-size:11.5px;">${escHtml(o.agency_ranks?.rank_name || 'Unranked')}</div></td>
+          <td><span class="${scoreClass(o.performance_score)}">${o.performance_score ?? '—'}${o.performance_score !== null ? '%' : ''}</span></td>
+          <td>${o.reviewCount}</td>
+          <td><span class="pill ${tierPill[o.tier]}">${escHtml(o.tier)}</span></td>
+          <td>${o.weight}×</td>
+          <td>${o.excluded
+            ? '<span class="pill">excluded — reviewed &lt; 30 days</span>'
+            : '<span class="pill pill-success">eligible</span>'}</td>
+        </tr>`;
+
+      const head = `<thead><tr><th>Officer</th><th>Score</th><th>Reviews</th><th>Tier</th><th>Weight</th><th>Status</th></tr></thead>`;
+
+      el.innerHTML = `
+        ${eligible.length ? `
+          <div class="table-wrap"><table class="data">${head}<tbody>${eligible.map(row).join('')}</tbody></table></div>`
+          : '<p class="text-muted">No eligible officers match.</p>'}
+        ${excluded.length ? `
+          <div style="margin-top:12px;">
+            <button type="button" class="btn btn-secondary btn-sm" id="toggle-excluded">
+              ${excluded.length} excluded (reviewed in last 30 days) — <span id="toggle-word">show</span>
+            </button>
+            <div id="excluded-wrap" hidden style="margin-top:8px;">
+              <div class="table-wrap"><table class="data">${head}<tbody>${excluded.map(row).join('')}</tbody></table></div>
+            </div>
+          </div>` : ''}`;
+
+      document.getElementById('toggle-excluded')?.addEventListener('click', () => {
+        const w = document.getElementById('excluded-wrap');
+        w.hidden = !w.hidden;
+        document.getElementById('toggle-word').textContent = w.hidden ? 'show' : 'hide';
+      });
     }
 
     async function run() {
@@ -179,7 +243,7 @@ Method: single draw, uniform random number scaled to cumulative weights (client-
                 <div style="font-family:var(--font-heading);font-size:22px;font-weight:700;">${escHtml(picked.last_name)}, ${escHtml(picked.first_name)} <span class="text-muted">#${escHtml(picked.badge_number || '—')}</span></div>
                 <div class="text-secondary">Incident type to review: <strong>${escHtml(incident?.name || '—')}</strong> · tier ${escHtml(picked.tier)} · ${picked.weight}× weight</div>
               </div>
-              <a class="btn btn-primary" href="review-new.html?officer_id=${escAttr(picked.id)}&incident_type_id=${escAttr(incident?.id || '')}">Start review</a>
+              <a class="btn btn-primary" href="review-new.html?officer_id=${escAttr(picked.id)}&incident_type_id=${escAttr(incident?.id || '')}&receipt_id=${escAttr(receipt.id)}">Start review</a>
             </div>
             <label class="field-label">Audit receipt (permanent)</label>
             <pre style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;white-space:pre-wrap;margin:0;">${escHtml(methodology)}</pre>
@@ -193,6 +257,7 @@ Method: single draw, uniform random number scaled to cumulative weights (client-
       }
     }
 
+    let showAllReceipts = false;
     async function loadReceipts() {
       const box = document.getElementById('receipts');
       if (!box) return;
@@ -200,7 +265,8 @@ Method: single draw, uniform random number scaled to cumulative weights (client-
       try {
         const { data, error } = await supabase.from('auto_select_receipts')
           .select('id, created_at, priority_level, selection_weight, incident_type_name, personnel_roster:officer_id (first_name, last_name, badge_number)')
-          .eq('supervisor_id', profile.id).order('created_at', { ascending: false }).limit(25);
+          .eq('supervisor_id', profile.id).order('created_at', { ascending: false })
+          .limit(showAllReceipts ? 1000 : 10);
         if (error) throw error;
         if (!data?.length) { renderEmpty(box, 'No selections yet', 'Your first Auto Select run will be recorded here permanently.'); return; }
         box.innerHTML = `
@@ -212,7 +278,9 @@ Method: single draw, uniform random number scaled to cumulative weights (client-
               <td>${escHtml(r.incident_type_name || '—')}</td>
               <td><span class="pill">${escHtml(r.priority_level || '—')}</span></td>
               <td>${escHtml(String(r.selection_weight ?? '—'))}×</td>
-            </tr>`).join('')}</tbody></table>`;
+            </tr>`).join('')}</tbody></table>
+          ${data.length >= 10 || showAllReceipts ? `<div style="margin-top:10px;"><button type="button" class="btn btn-secondary btn-sm" id="receipts-toggle">${showAllReceipts ? 'Show last 10' : 'View all receipts'}</button></div>` : ''}`;
+        document.getElementById('receipts-toggle')?.addEventListener('click', () => { showAllReceipts = !showAllReceipts; loadReceipts(); });
       } catch (e) {
         showError(e, 'Receipts');
         renderErrorState(box);

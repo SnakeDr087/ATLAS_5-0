@@ -136,6 +136,10 @@ export class OfficerSearch {
 
   getValue() { return this.selected; }
 
+  // Programmatically select an officer (e.g. prefill from an Auto Select
+  // receipt link). Same path as a user pick, including onSelect.
+  preselect(officer) { if (officer) this._pick(officer); }
+
   clear() {
     this.selected = null;
     this.selectedEl.hidden = true;

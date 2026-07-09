@@ -38,6 +38,7 @@
     const kpiState = {};               // kpi_id -> observed/not_observed/na
     let universalPick = null;
     let outcomePick = 'no_action';
+    let receiptId = null;
     let primaryOS, backupOS;
     const backups = [];                // {id, first_name, last_name, badge_number}
     let sameRankRule = true;
@@ -238,12 +239,25 @@
 
       document.getElementById('submit-btn').addEventListener('click', submit);
 
-      // Prefill from an Auto Select receipt (?officer_id=&incident_type_id=)
+      // Prefill from an Auto Select receipt (?officer_id=&incident_type_id=&receipt_id=)
       const params = new URLSearchParams(location.search);
       const pType = params.get('incident_type_id');
       if (pType && incidentTypes.some((t) => t.id === pType)) {
         document.getElementById('f-incident-type').value = pType;
         loadKpis();
+      }
+      const pOfficer = params.get('officer_id');
+      if (pOfficer) {
+        (async () => {
+          const { data: preOff } = await supabase.from('personnel_roster')
+            .select('id, first_name, last_name, badge_number, officer_status, agency_id')
+            .eq('id', pOfficer).maybeSingle();
+          if (preOff && preOff.agency_id === agencyId) primaryOS.preselect(preOff);
+        })().catch(() => { /* prefill is best-effort; form remains usable */ });
+      }
+      receiptId = params.get('receipt_id') || null;
+      if (receiptId) {
+        toast('Prefilled from Auto Select — this review will be linked to its selection receipt.');
       }
     }
 
@@ -347,6 +361,7 @@
           police_case_number: document.getElementById('f-police-case').value.trim() || null,
           reviewer_id: profile.id,
           primary_officer_id: officer.id,
+          auto_select_receipt_id: receiptId,
           backup_officer_ids: backups.map((b) => b.id),
           review_date: document.getElementById('f-review-date').value || new Date().toISOString().slice(0, 10),
           incident_date: document.getElementById('f-incident-date').value || null,
