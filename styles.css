@@ -312,3 +312,15 @@ tr.rowlink:hover td { background: var(--accent-dim); }
   .content { padding: 18px 16px 50px; }
   .section-nav { top: 0; }
 }
+
+/* super_admin topbar agency selector */
+.agency-select-wrap {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  border-radius: var(--border-radius); padding: 4px 10px; margin-right: 8px;
+}
+.agency-select-wrap select {
+  border: none; background: transparent; font-size: 13px; font-weight: 600;
+  color: var(--text); padding: 2px 4px; cursor: pointer; max-width: 220px;
+}
+.agency-select-wrap select:focus { outline: none; }

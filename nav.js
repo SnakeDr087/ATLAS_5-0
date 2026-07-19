@@ -4,6 +4,7 @@
 // auth.js — there is no second hand-maintained role list to drift.
 // ============================================================================
 import { ROLE_PERMISSIONS, signOut } from './auth.js';
+import { supabase } from './supabase-client.js';
 import { escHtml, escAttr } from './error-handler.js';
 
 const ICONS = {
@@ -111,10 +112,45 @@ export function renderTopbar(title, profile, extraHtml = '') {
   el.innerHTML = `
     <h1 class="page-title">${escHtml(title)}</h1>
     <div class="topbar-right">
+      <span id="agency-selector-slot"></span>
       <span id="topbar-context"></span>
       ${extraHtml}
       <button class="bell-btn" title="Notifications" aria-label="Notifications">
         <svg viewBox="0 0 24 24"><path d="M12 22a2.5 2.5 0 002.4-2h-4.8A2.5 2.5 0 0012 22zm7-5v1H5v-1l1.5-1.5V11a5.5 5.5 0 014-5.3V5a1.5 1.5 0 013 0v.7a5.5 5.5 0 014 5.3v4.5L19 17z"/></svg>
       </button>
     </div>`;
+  // Platform owner gets a persistent agency selector that scopes every page.
+  if (profile.role === 'super_admin') mountAgencySelector(profile);
+}
+
+// super_admin-only. "All Agencies" (cumulative) + one entry per agency. The
+// choice is carried in ?agency_id= so every agency-scoped page follows it;
+// 'all' or absent means cumulative mode (dashboard/reports aggregate).
+async function mountAgencySelector(profile) {
+  const slot = document.getElementById('agency-selector-slot');
+  if (!slot) return;
+  const current = new URLSearchParams(location.search).get('agency_id') || 'all';
+  const { data: agencies } = await supabase.from('agencies')
+    .select('id, name, is_active').order('name');
+  slot.innerHTML = `
+    <label class="agency-select-wrap" title="Platform agency context">
+      <svg viewBox="0 0 24 24" width="15" height="15" style="opacity:.6;"><path d="M3 21h18v-2H3v2zM5 8h2v9H5V8zm4 0h2v9H9V8zm4-5L5 6v1h16V6l-8-3zm2 5h2v9h-2V8z"/></svg>
+      <select id="agency-select">
+        <option value="all"${current === 'all' ? ' selected' : ''}>All Agencies (cumulative)</option>
+        ${(agencies || []).map((a) => `
+          <option value="${escAttr(a.id)}"${current === a.id ? ' selected' : ''}>${escHtml(a.name)}${a.is_active ? '' : ' (inactive)'}</option>`).join('')}
+      </select>
+    </label>`;
+  document.getElementById('agency-select').addEventListener('change', (e) => {
+    const params = new URLSearchParams(location.search);
+    if (e.target.value === 'all') params.delete('agency_id');
+    else params.set('agency_id', e.target.value);
+    // Land on dashboard when switching to cumulative (only dashboard/reports aggregate),
+    // otherwise reload the current page in the new agency context.
+    if (e.target.value === 'all' && !/dashboard\.html/.test(location.pathname)) {
+      location.href = 'dashboard.html';
+    } else {
+      location.search = params.toString();
+    }
+  });
 }

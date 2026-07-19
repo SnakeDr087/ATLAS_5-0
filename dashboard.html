@@ -77,6 +77,73 @@
 
     // ------------------------------------------------------------------ SUPER ADMIN
     async function superAdminDash() {
+      // When the topbar selector has picked a specific agency, super_admin sees
+      // that agency's real dashboard (chief-style). "All Agencies" (no param) =
+      // the cumulative platform view with the per-agency scoreboard.
+      const picked = new URLSearchParams(location.search).get('agency_id');
+      if (picked) { await chiefDash(); return; }
+
+      let ov;
+      try {
+        const { data, error } = await supabase.rpc('platform_overview');
+        if (error) throw error;
+        ov = data;
+      } catch (e) {
+        showError(e, 'Platform overview');
+        // fall back to the simple counts if the RPC isn't deployed yet
+        ov = null;
+      }
+
+      if (ov) {
+        const board = ov.scoreboard || [];
+        content.innerHTML = `
+          <div class="stat-grid">
+            ${stat('Agencies', `${ov.active_agencies}/${ov.agency_count}`)}
+            ${stat('Officers (all agencies)', ov.officer_count)}
+            ${stat('Total reviews', ov.review_count)}
+            ${stat('Open IA', ov.open_ia, ov.open_ia ? 'warning' : 'success')}
+            ${stat('Open Delta T', ov.open_delta_t)}
+            ${stat('Active PIPs', ov.active_pips)}
+          </div>
+
+          <div class="card">
+            <h2 class="card-title">Agency Performance Scoreboard</h2>
+            <p class="card-sub" style="margin:2px 0 12px;">Cumulative across the platform — each agency's outcome-based score, ranked. Use the selector above to drill into one agency.</p>
+            ${board.length ? `
+              <div class="table-wrap"><table class="data">
+                <thead><tr><th>#</th><th>Agency</th><th>State</th><th>Officers</th><th>Reviews</th><th>Score</th></tr></thead>
+                <tbody>
+                  ${board.map((a, i) => `
+                    <tr class="rowlink" data-agency="${escAttr(a.agency_id)}">
+                      <td>${i + 1}</td>
+                      <td><strong>${escHtml(a.name)}</strong></td>
+                      <td>${escHtml(a.state || '')}</td>
+                      <td>${a.officers}</td>
+                      <td>${a.reviews}</td>
+                      <td><span class="pill ${a.pct == null ? '' : a.pct >= (a.threshold || 80) ? 'pill-success' : a.pct >= 65 ? 'pill-warning' : 'pill-danger'}">${a.pct == null ? '—' : a.pct + '%'}</span></td>
+                    </tr>`).join('')}
+                </tbody>
+              </table></div>` : '<p class="text-muted">No agencies yet. Create the first in the Admin Panel.</p>'}
+          </div>
+
+          <div class="card">
+            <div class="flex-between"><h2 class="card-title mb-0">Platform Administration</h2>
+              <a class="btn btn-primary btn-sm" href="admin.html">Admin Panel</a></div>
+            <div class="check-grid" style="margin-top:12px;">
+              <label class="check-item"><input type="checkbox" ${ov.agency_count ? 'checked' : ''} disabled> At least one agency created</label>
+              <label class="check-item"><input type="checkbox" ${ov.user_count ? 'checked' : ''} disabled> Agency users onboarded</label>
+              <label class="check-item"><input type="checkbox" ${ov.officer_count ? 'checked' : ''} disabled> Rosters populated</label>
+              <label class="check-item"><input type="checkbox" ${ov.review_count ? 'checked' : ''} disabled> First review submitted</label>
+            </div>
+          </div>`;
+
+        // Clicking an agency row selects it (drills in via the selector context).
+        content.querySelectorAll('.rowlink[data-agency]').forEach((tr) =>
+          tr.addEventListener('click', () => { location.href = `dashboard.html?agency_id=${encodeURIComponent(tr.dataset.agency)}`; }));
+        return;
+      }
+
+      // -------- fallback (RPC not yet deployed): original simple overview -----
       const [{ data: agencies, error: aErr }, users, officers, reviews, tickets] = await Promise.all([
         supabase.from('agencies').select('id, name, state, is_active').order('name'),
         count('profiles'),
