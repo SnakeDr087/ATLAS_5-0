@@ -86,7 +86,7 @@ export function renderNav(profile, activeKey) {
 
   el.innerHTML = `
     <div class="brand">
-      <div class="brand-mark">A</div>
+      <div class="brand-mark"><img src="atlas-logo.png" alt="ATLAS" /></div>
       <div>
         <div class="brand-name">ATLAS</div>
         <div class="brand-agency">${escHtml(profile.agency?.name || 'Platform Administration')}</div>
