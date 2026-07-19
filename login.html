@@ -5,35 +5,90 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Sign In · ATLAS</title>
   <link rel="stylesheet" href="styles.css" />
+  <style>
+    /* ---- Branded login: midnight-blue field, logo above a lower white card ---- */
+    :root { --midnight: #0d1b2e; --midnight-deep: #091320; }
+    .login-page {
+      min-height: 100vh;
+      background: radial-gradient(ellipse at 50% 20%, #14263f 0%, var(--midnight) 55%, var(--midnight-deep) 100%);
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: flex-start;
+      padding: 0 20px 48px;
+    }
+    .login-logo {
+      width: 190px; height: 190px; object-fit: contain;
+      margin-top: 8vh; margin-bottom: 8px;
+      filter: drop-shadow(0 8px 26px rgba(0,0,0,0.45));
+    }
+    .login-wordmark {
+      color: #fff; font-family: var(--font-heading, 'Segoe UI', system-ui, sans-serif);
+      font-weight: 700; letter-spacing: 0.18em; font-size: 30px; margin: 0;
+    }
+    .login-tagline {
+      color: #9fb4d0; font-size: 13px; letter-spacing: 0.05em;
+      margin: 4px 0 0; text-transform: uppercase;
+    }
+    .login-card {
+      background: #fff; border-radius: 14px; width: 100%; max-width: 400px;
+      margin-top: 40px; padding: 0 0 26px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+      overflow: hidden;
+    }
+    .login-card-banner {
+      background: var(--midnight); color: #fff; text-align: center;
+      font-family: var(--font-heading, 'Segoe UI', system-ui, sans-serif);
+      font-weight: 600; letter-spacing: 0.08em; font-size: 15px;
+      padding: 16px; text-transform: uppercase;
+    }
+    .login-card-body { padding: 26px 28px 4px; }
+    .login-card .field-label { color: #33465c; }
+    .login-card input {
+      width: 100%; box-sizing: border-box;
+    }
+    .btn-signin {
+      width: 100%; background: var(--midnight); color: #fff; border: none;
+      padding: 13px; border-radius: 8px; font-size: 15px; font-weight: 600;
+      letter-spacing: 0.04em; cursor: pointer; margin-top: 6px;
+      transition: background .15s;
+    }
+    .btn-signin:hover { background: #12233b; }
+    .btn-signin:disabled { opacity: .6; cursor: default; }
+    .login-links { text-align: center; margin: 16px 0 0; font-size: 13px; }
+    .login-links a { color: var(--midnight); font-weight: 600; text-decoration: none; }
+    .login-links a:hover { text-decoration: underline; }
+    .login-copyright {
+      color: #6b82a0; font-size: 12px; letter-spacing: 0.03em;
+      margin-top: 26px; text-align: center;
+    }
+  </style>
 </head>
 <body>
-  <div class="auth-shell">
-    <div class="auth-card">
-      <div class="auth-brand">
-        <div class="brand-mark">A</div>
-        <div>
-          <div class="auth-title">ATLAS</div>
-          <div class="auth-sub">Performance Management</div>
+  <div class="login-page">
+    <img src="atlas-logo.png" alt="ATLAS" class="login-logo" />
+    <h1 class="login-wordmark">ATLAS</h1>
+    <p class="login-tagline">Performance Management</p>
+
+    <div class="login-card">
+      <div class="login-card-banner">Sign In</div>
+      <div class="login-card-body">
+        <div id="banner"></div>
+        <div class="form-row">
+          <label class="field-label" for="email">Email</label>
+          <input type="email" id="email" autocomplete="username" />
         </div>
+        <div class="form-row">
+          <label class="field-label" for="password">Password</label>
+          <input type="password" id="password" autocomplete="current-password" />
+        </div>
+        <button class="btn-signin" id="signin-btn">Sign In</button>
+        <p class="login-links">
+          <a href="forgot-password.html">Forgot password?</a>
+        </p>
       </div>
-      <div id="banner"></div>
-      <div class="form-row">
-        <label class="field-label" for="email">Email</label>
-        <input type="email" id="email" autocomplete="username" />
-      </div>
-      <div class="form-row">
-        <label class="field-label" for="password">Password</label>
-        <input type="password" id="password" autocomplete="current-password" />
-      </div>
-      <button class="btn btn-primary" id="signin-btn" style="width:100%;">Sign in</button>
-      <p style="text-align:center;margin:14px 0 0;font-size:13px;">
-        <a href="forgot-password.html">Forgot password?</a>
-        &nbsp;·&nbsp;
-        <a href="#" id="request-access-link">Request access</a>
-      </p>
     </div>
+
+    <p class="login-copyright">ATLAS PM Inc. &nbsp;&copy;&nbsp;Copyright 2025 &nbsp;|&nbsp; All rights reserved</p>
   </div>
-  <div id="modal-slot"></div>
 
   <script type="module">
     // ---- Login: profile is fetched separately from agency (split queries) so
@@ -47,7 +102,7 @@
     if (err === 'deactivated') {
       banner.innerHTML = `<div class="notice notice-danger" style="margin-bottom:14px;">This account has been deactivated. Contact your agency administrator.</div>`;
     } else if (err === 'no_profile') {
-      banner.innerHTML = `<div class="notice notice-warning" style="margin-bottom:14px;">Your sign-in succeeded but no ATLAS profile exists for this account yet. Ask your agency administrator to complete your setup, or submit an access request.</div>`;
+      banner.innerHTML = `<div class="notice notice-warning" style="margin-bottom:14px;">Your sign-in succeeded but no ATLAS profile exists for this account yet. Ask your agency administrator to complete your setup.</div>`;
     }
 
     const btn = document.getElementById('signin-btn');
@@ -76,7 +131,6 @@
           return;
         }
         // Split query 2: agency — only if one exists (super_admin has none).
-        // (auth.js repeats this on the next page; the call here just validates.)
         if (profile.agency_id) {
           await supabase.from('agencies').select('id').eq('id', profile.agency_id).maybeSingle();
         }
@@ -86,55 +140,12 @@
         location.href = redirect ? decodeURIComponent(redirect) : 'dashboard.html';
       } catch (e) {
         showError(e, 'Sign in failed');
-        btn.disabled = false; btn.textContent = 'Sign in';
+        btn.disabled = false; btn.textContent = 'Sign In';
       }
     }
 
     btn.addEventListener('click', signIn);
     document.getElementById('password').addEventListener('keydown', (e) => { if (e.key === 'Enter') signIn(); });
-
-    // ---- Request access (anonymous insert into access_requests) --------
-    document.getElementById('request-access-link').addEventListener('click', (e) => {
-      e.preventDefault();
-      const slot = document.getElementById('modal-slot');
-      slot.innerHTML = `
-        <div class="modal-backdrop">
-          <div class="modal">
-            <h3 class="card-title">Request Access</h3>
-            <p class="text-secondary mt-0">Submit your details and your agency administrator will review the request.</p>
-            <div class="form-grid">
-              <div><label class="field-label" for="ra-name">Full name *</label><input id="ra-name" /></div>
-              <div><label class="field-label" for="ra-email">Email *</label><input id="ra-email" type="email" /></div>
-              <div><label class="field-label" for="ra-agency">Agency name *</label><input id="ra-agency" placeholder="e.g. Anytown Police Department" /></div>
-              <div><label class="field-label" for="ra-msg">Message (role requested, rank, unit, etc.)</label><textarea id="ra-msg" rows="3"></textarea></div>
-            </div>
-            <div class="flex-between" style="margin-top:16px;">
-              <button class="btn btn-secondary" id="ra-cancel">Cancel</button>
-              <button class="btn btn-primary" id="ra-submit">Submit Request</button>
-            </div>
-          </div>
-        </div>`;
-      slot.querySelector('#ra-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
-      slot.querySelector('#ra-submit').addEventListener('click', async () => {
-        const full_name = slot.querySelector('#ra-name').value.trim();
-        const email = slot.querySelector('#ra-email').value.trim();
-        const agency_name = slot.querySelector('#ra-agency').value.trim();
-        const message = slot.querySelector('#ra-msg').value.trim() || null;
-        if (!full_name || !email || !agency_name) { toast('Name, email, and agency are required.', 'error'); return; }
-        const sBtn = slot.querySelector('#ra-submit');
-        sBtn.disabled = true;
-        try {
-          const { error } = await supabase.from('access_requests')
-            .insert({ full_name, email, agency_name, message });
-          if (error) throw error;
-          slot.innerHTML = '';
-          toast('Access request submitted. An administrator will review it.', 'success');
-        } catch (e2) {
-          showError(e2, 'Request access');
-          sBtn.disabled = false;
-        }
-      });
-    });
   </script>
 </body>
 </html>
