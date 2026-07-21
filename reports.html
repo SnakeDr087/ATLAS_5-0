@@ -78,7 +78,8 @@
             supabase.from('delta_t_cases')
               .select(`id, status, t1_incident_date, t2_training_delivered, t4_verification_date,
                        officer:officer_id (first_name, last_name, badge_number),
-                       kpi:kpi_id (kpi_text)`)
+                       kpi:kpi_id (kpi_text),
+                       source:source_review_id (review_date)`)
               .eq('agency_id', agencyId).order('t1_incident_date', { ascending: false }),
             supabase.from('training_assignments')
               .select(`id, course, assigned_date, date_delivered,
@@ -116,8 +117,10 @@
 
         // Delta T intervals (closed/verified cases only)
         const closed = deltaTs.filter((d) => d.status === 'closed' && d.t4_verification_date);
-        const t12 = closed.map((d) => daysBetween(d.t1_incident_date, d.t2_training_delivered)).filter((v) => v !== null);
-        const t24 = closed.map((d) => daysBetween(d.t2_training_delivered, d.t4_verification_date)).filter((v) => v !== null);
+        const det = (d) => d.source?.review_date || null;   // T2 · Detection
+        const t12 = closed.map((d) => daysBetween(d.t1_incident_date, det(d))).filter((v) => v !== null);
+        const t23 = closed.map((d) => daysBetween(det(d), d.t2_training_delivered)).filter((v) => v !== null);
+        const t34 = closed.map((d) => daysBetween(d.t2_training_delivered, d.t4_verification_date)).filter((v) => v !== null);
         const avg = (arr) => arr.length ? (arr.reduce((a, b) => a + b, 0) / arr.length) : null;
         const openDT = deltaTs.filter((d) => d.status === 'open');
         const flagged = openDT.filter((d) => {
@@ -134,8 +137,9 @@
               <div class="stat-label">Avg KPI Score</div>
             </div>
             <div class="stat ${flagged.length ? 'danger' : ''}"><div class="stat-value">${openDT.length}</div><div class="stat-label">Open Delta T (${flagged.length} flagged)</div></div>
-            <div class="stat"><div class="stat-value">${avg(t12) === null ? '—' : avg(t12).toFixed(0) + 'd'}</div><div class="stat-label">Avg T1→T2 (response lag)</div></div>
-            <div class="stat"><div class="stat-value">${avg(t24) === null ? '—' : avg(t24).toFixed(0) + 'd'}</div><div class="stat-label">Avg T2→T4 (correction lag)</div></div>
+            <div class="stat"><div class="stat-value">${avg(t12) === null ? '—' : avg(t12).toFixed(0) + 'd'}</div><div class="stat-label">Avg T1→T2 (detection lag)</div></div>
+            <div class="stat"><div class="stat-value">${avg(t23) === null ? '—' : avg(t23).toFixed(0) + 'd'}</div><div class="stat-label">Avg T2→T3 (response lag)</div></div>
+            <div class="stat"><div class="stat-value">${avg(t34) === null ? '—' : avg(t34).toFixed(0) + 'd'}</div><div class="stat-label">Avg T3→T4 (correction lag)</div></div>
           </div>
 
           <div style="display:grid; grid-template-columns: 3fr 2fr; gap:20px; margin-top:20px;">
@@ -173,10 +177,10 @@
         } else {
           dtEl.innerHTML = `
             <div class="table-wrap"><table class="data">
-              <thead><tr><th>Officer</th><th>KPI</th><th>Status</th><th>T1</th><th>T2</th><th>T4</th><th>T1→T2</th><th>T2→T4</th></tr></thead>
+              <thead><tr><th>Officer</th><th>KPI</th><th>Status</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>Δ T1→T4</th></tr></thead>
               <tbody>${deltaTs.map((d) => {
-                const a = daysBetween(d.t1_incident_date, d.t2_training_delivered);
-                const b = daysBetween(d.t2_training_delivered, d.t4_verification_date);
+                const detDate = d.source?.review_date || null;                        // T2 · Detection
+                const total = daysBetween(d.t1_incident_date, d.t4_verification_date); // full cycle T1→T4
                 const openDays = d.status === 'open' ? daysBetween(d.t1_incident_date, new Date().toISOString()) : null;
                 const isFlagged = openDays !== null && openDays >= 90;
                 return `
@@ -185,10 +189,10 @@
                   <td>${escHtml(d.kpi?.kpi_text || '—')}</td>
                   <td><span class="pill ${d.status === 'open' ? (isFlagged ? 'pill-danger' : 'pill-warning') : 'pill-success'}">${isFlagged ? 'flagged 90+' : escHtml(d.status)}</span></td>
                   <td>${fmtDate(d.t1_incident_date)}</td>
+                  <td>${detDate ? fmtDate(detDate) : '—'}</td>
                   <td>${d.t2_training_delivered ? fmtDate(d.t2_training_delivered) : '—'}</td>
                   <td>${d.t4_verification_date ? fmtDate(d.t4_verification_date) : '—'}</td>
-                  <td>${a === null ? '—' : a + 'd'}</td>
-                  <td>${b === null ? '—' : b + 'd'}</td>
+                  <td>${total === null ? '—' : total + 'd'}</td>
                 </tr>`;
               }).join('')}
               </tbody></table></div>`;

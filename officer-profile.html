@@ -215,7 +215,7 @@
       } else {
         dtEl.innerHTML = `
           <div class="table-wrap"><table class="data">
-            <thead><tr><th>KPI</th><th>Status</th><th>T1</th><th>Age / Δ</th></tr></thead>
+            <thead><tr><th>KPI</th><th>Status</th><th>T1 Incident</th><th>Age / Δ T1→T4</th></tr></thead>
             <tbody>${deltaTs.map((d) => {
               const days = d.status === 'open'
                 ? daysBetween(d.t1_incident_date, new Date().toISOString())
