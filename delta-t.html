@@ -38,7 +38,8 @@
         const { data, error } = await supabase.from('delta_t_cases')
           .select(`id, status, t1_incident_date, t2_training_delivered, t4_verification_date, created_at,
                    personnel_roster:officer_id (id, first_name, last_name, badge_number),
-                   kpi_definitions:kpi_id (kpi_text)`)
+                   kpi_definitions:kpi_id (kpi_text),
+                   source:source_review_id (review_date)`)
           .eq('agency_id', agencyId).order('created_at', { ascending: false });
         if (error) throw error;
         rows = data || [];
@@ -52,9 +53,8 @@
       rows.forEach((r) => {
         r._age = daysBetween(r.t1_incident_date, today) ?? 0;
         r._flagged = r.status === 'open' && r._age >= 90;
-        r._t1t2 = daysBetween(r.t1_incident_date, r.t2_training_delivered);
-        r._t2t4 = daysBetween(r.t2_training_delivered, r.t4_verification_date);
-        r._total = daysBetween(r.t1_incident_date, r.t4_verification_date);
+        r._detection = r.source?.review_date || null;                       // T2 · Detection
+        r._total = daysBetween(r.t1_incident_date, r.t4_verification_date); // full cycle T1→T4
       });
 
       const open = rows.filter((r) => r.status === 'open');
@@ -99,16 +99,16 @@
         if (!list.length) { renderEmpty(table, 'No intervention cases match', 'Delta T cases open automatically when a review outcome is Training.'); return; }
         table.innerHTML = `
           <table class="data">
-            <thead><tr><th>Officer</th><th>Deficient KPI</th><th>T1 observed</th><th>T2 trained</th><th>T4 verified</th><th>T1→T2</th><th>T2→T4</th><th>Status</th></tr></thead>
+            <thead><tr><th>Officer</th><th>Deficient KPI</th><th>T1 Incident</th><th>T2 Detection</th><th>T3 Intervention</th><th>T4 Verification</th><th>Δ T1→T4</th><th>Status</th></tr></thead>
             <tbody>${list.map((r) => `
               <tr class="rowlink" data-id="${escAttr(r.id)}">
                 <td>${escHtml(r.personnel_roster?.last_name || '')}, ${escHtml(r.personnel_roster?.first_name || '')} <span class="text-muted">#${escHtml(r.personnel_roster?.badge_number || '')}</span></td>
                 <td style="max-width:320px;">${escHtml(r.kpi_definitions?.kpi_text || '—')}</td>
                 <td>${fmtDate(r.t1_incident_date)}</td>
+                <td>${fmtDate(r._detection)}</td>
                 <td>${fmtDate(r.t2_training_delivered)}</td>
                 <td>${fmtDate(r.t4_verification_date)}</td>
-                <td>${r._t1t2 !== null ? r._t1t2 + 'd' : '—'}</td>
-                <td>${r._t2t4 !== null ? r._t2t4 + 'd' : '—'}</td>
+                <td>${r._total !== null ? r._total + 'd' : '—'}</td>
                 <td>${r._flagged ? '<span class="pill pill-danger">⚑ 90+ days</span>' : r.status === 'open' ? '<span class="pill pill-warning">open</span>' : '<span class="pill pill-success">closed</span>'}</td>
               </tr>`).join('')}</tbody>
           </table>`;
