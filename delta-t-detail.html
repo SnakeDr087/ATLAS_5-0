@@ -38,7 +38,7 @@
         const { data, error } = await supabase.from('delta_t_cases')
           .select(`*, personnel_roster:officer_id (id, first_name, last_name, badge_number),
                    kpi_definitions:kpi_id (id, kpi_text),
-                   source:source_review_id (id, atlas_case_number)`)
+                   source:source_review_id (id, atlas_case_number, review_date)`)
           .eq('id', id).maybeSingle();
         if (error) throw error;
         if (!data) { renderEmpty(content, 'Case not found', 'It may not exist or you may not have access to it.'); return; }
@@ -55,8 +55,10 @@
 
     function render() {
       const today = new Date().toISOString().slice(0, 10);
-      const t1t2 = daysBetween(c.t1_incident_date, c.t2_training_delivered);
-      const t2t4 = daysBetween(c.t2_training_delivered, c.t4_verification_date);
+      const detectionDate = c.source?.review_date || null;                        // T2 · Detection = review that caught the deficiency
+      const t1t2 = daysBetween(c.t1_incident_date, detectionDate);                 // incident → detection
+      const t2t3 = daysBetween(detectionDate, c.t2_training_delivered);            // detection → intervention
+      const t3t4 = daysBetween(c.t2_training_delivered, c.t4_verification_date);   // intervention → verification
       const age = daysBetween(c.t1_incident_date, today);
       const flagged = c.status === 'open' && age >= 90;
       const canManage = ['internal_affairs', 'training_bureau', 'supervisor'].includes(profile.role);
@@ -86,15 +88,18 @@
             · Officer profile: <a href="officer-profile.html?id=${escAttr(c.personnel_roster?.id || '')}">view</a></p>
 
           <div class="dt-timeline">
-            ${node('T1 · Deficiency observed', c.t1_incident_date, true)}
+            ${node('T1 · Incident', c.t1_incident_date, true)}
+            <div class="dt-line ${detectionDate ? 'done' : ''}"></div>
+            ${node('T2 · Detection', detectionDate, !!detectionDate)}
             <div class="dt-line ${c.t2_training_delivered ? 'done' : ''}"></div>
-            ${node('T2 · Training delivered', c.t2_training_delivered, !!c.t2_training_delivered)}
+            ${node('T3 · Intervention', c.t2_training_delivered, !!c.t2_training_delivered)}
             <div class="dt-line ${c.t4_verification_date ? 'done' : ''}"></div>
-            ${node('T4 · KPI verified', c.t4_verification_date, !!c.t4_verification_date)}
+            ${node('T4 · Verification', c.t4_verification_date, !!c.t4_verification_date)}
           </div>
           <div class="detail-grid">
-            <div class="detail-item"><div class="dl">T1 → T2 response lag</div><div class="dv">${t1t2 !== null ? t1t2 + ' days' : 'pending training'}</div></div>
-            <div class="detail-item"><div class="dl">T2 → T4 correction lag</div><div class="dv">${t2t4 !== null ? t2t4 + ' days' : 'pending verification'}</div></div>
+            <div class="detail-item"><div class="dl">T1 → T2 detection lag</div><div class="dv">${t1t2 !== null ? t1t2 + ' days' : 'pending detection'}</div></div>
+            <div class="detail-item"><div class="dl">T2 → T3 response lag</div><div class="dv">${t2t3 !== null ? t2t3 + ' days' : 'pending training'}</div></div>
+            <div class="detail-item"><div class="dl">T3 → T4 correction lag</div><div class="dv">${t3t4 !== null ? t3t4 + ' days' : 'pending verification'}</div></div>
             <div class="detail-item"><div class="dl">Case age</div><div class="dv">${age} days</div></div>
           </div>
           ${c.status === 'open' && c.t2_training_delivered && canManage ? `
@@ -114,7 +119,7 @@
                 ${a.date_delivered
                   ? `<span class="pill pill-success">delivered ${fmtDate(a.date_delivered)}</span>`
                   : canManage && c.status === 'open'
-                    ? `<button class="btn btn-success btn-sm deliver-btn" data-id="${escAttr(a.id)}">Mark delivered (stamps T2)</button>`
+                    ? `<button class="btn btn-success btn-sm deliver-btn" data-id="${escAttr(a.id)}">Mark delivered (stamps T3)</button>`
                     : `<span class="pill pill-warning">pending</span>`}
               </div>`).join('') || '<p class="text-muted">No training assigned yet.</p>'}
           </div>
@@ -148,7 +153,7 @@
       } catch (e) { showError(e, 'Assign training'); }
     }
 
-    // Delivering training stamps T2 on the parent Delta T case.
+    // Delivering training stamps T3 (Intervention) on the parent Delta T case.
     async function deliver(assignmentId) {
       const today = new Date().toISOString().slice(0, 10);
       try {
@@ -161,7 +166,7 @@
           if (e2) throw e2;
         }
         await logActivity(profile, 'training_delivered', 'training_assignment', assignmentId, { delta_t_case: c.id, t2_stamped: !c.t2_training_delivered });
-        toast('Delivery recorded — T2 stamped.');
+        toast('Delivery recorded — T3 stamped.');
         await load();
       } catch (e) { showError(e, 'Mark delivered'); }
     }
