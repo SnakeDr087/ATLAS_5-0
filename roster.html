@@ -82,13 +82,16 @@
         `;
 
         // Attach search — agency-wide scope (supervisorId omitted on purpose).
-        new OfficerSearch(document.getElementById('attach-search'), {
+        // Capture the instance so we can reset it on the paths that DON'T reload.
+        const attachOS = new OfficerSearch(document.getElementById('attach-search'), {
           agencyId,
           placeholder: 'Search agency roster by name or badge…',
           onSelect: async (officer) => {
             if (!officer) return; // cleared
             if (rows.some((r) => r.officer.id === officer.id)) {
-              toast('Officer is already on your roster.', 'error'); return;
+              toast('Officer is already on your roster.', 'error');
+              attachOS.clear();          // reset so the search box comes back
+              return;
             }
             try {
               const { error } = await supabase.from('supervisor_rosters')
@@ -97,8 +100,11 @@
               await logActivity(profile, 'roster_attach', 'personnel_roster', officer.id,
                 { officer: `${officer.last_name}, ${officer.first_name}` });
               toast(`${officer.last_name}, ${officer.first_name} added to your roster.`, 'success');
-              load();
-            } catch (e) { showError(e, 'Attach officer'); }
+              load();                    // full reload → fresh picker
+            } catch (e) {
+              showError(e, 'Attach officer');
+              attachOS.clear();          // reset so they aren't stuck on the failed pick
+            }
           },
         });
 
