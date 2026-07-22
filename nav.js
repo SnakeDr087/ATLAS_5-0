@@ -59,8 +59,34 @@ const ROLE_LABELS = {
   training_bureau: 'Training Bureau', agency_admin: 'Agency Admin', supervisor: 'Supervisor',
 };
 
+// Rank / title tokens skipped when deriving initials, so a stored name that
+// carries a rank ("Sgt. David Marsh") yields DM, not SD. Matched case-insensitively
+// with trailing punctuation stripped, so "Sgt.", "SGT", "sgt" all match.
+const RANK_PREFIXES = new Set([
+  'ofc', 'officer', 'sgt', 'sergeant', 'lt', 'lieutenant', 'cpl', 'corporal',
+  'capt', 'cpt', 'captain', 'cmdr', 'commander', 'det', 'detective', 'chief',
+  'dep', 'deputy', 'maj', 'major', 'col', 'colonel', 'sheriff', 'insp', 'inspector',
+  'sofc', 'po', 'dpo', 'sup', 'supt', 'superintendent',
+]);
+
+// Derive up-to-two-letter initials from a display name. Skips leading rank/title
+// tokens and uses the FIRST and LAST remaining name parts (middle initials are
+// ignored), so:
+//   "Sgt. David Marsh"        -> DM
+//   "Chief Robert T. Callahan"-> RC
+//   "Lt. Simone Ashford"      -> SA
+//   "Karen Molloy"            -> KM
+//   "Madonna"                 -> M
 function initials(name) {
-  return (name || '?').split(/\s+/).map((w) => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase();
+  if (!name) return '?';
+  let parts = String(name).trim().split(/\s+/);
+  // Drop any leading rank/title tokens (strip trailing punctuation before matching).
+  while (parts.length > 1 && RANK_PREFIXES.has(parts[0].toLowerCase().replace(/[.,]/g, ''))) {
+    parts.shift();
+  }
+  const first = parts[0] || '';
+  const last = parts.length > 1 ? parts[parts.length - 1] : '';
+  return ((first[0] || '') + (last[0] || '')).toUpperCase() || '?';
 }
 
 export function renderNav(profile, activeKey) {
