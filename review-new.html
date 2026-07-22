@@ -197,7 +197,7 @@
       const scope = profile.role === 'supervisor' ? { supervisorId: profile.id } : {};
       primaryOS = new OfficerSearch(document.getElementById('primary-officer'), { agencyId, ...scope });
       backupOS = new OfficerSearch(document.getElementById('backup-officer'), {
-        agencyId, ...scope, placeholder: 'Add backup officer…',
+        agencyId, placeholder: 'Add backup officer…',
         onSelect: (o) => { if (o) { addBackup(o); backupOS.clear(); } },
       });
 
