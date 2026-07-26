@@ -14,6 +14,10 @@ const ALL = ROLES;
 // ---------------------------------------------------------------------------
 // PERMISSION TRUTH — the only client-side role/page matrix. nav.js derives its
 // menu from this; nothing else maintains a role list.
+//
+// NOTE: 'officer' is intentionally ABSENT from every page below. Officers are a
+// training-only role; they have no reviewer pages. They are caught in bootPage
+// and redirected to the trainer BEFORE any page check runs (see below).
 // ---------------------------------------------------------------------------
 export const ROLE_PERMISSIONS = {
   dashboard:           ALL,
@@ -105,6 +109,16 @@ export async function bootPage(pageKey, title) {
     location.replace('login.html?err=deactivated');
     throw new Error('account deactivated');
   }
+
+  // Officers are a TRAINING-ONLY role — they never enter the reviewer. Catch any
+  // officer session that reaches a main-app page and send it to the trainer,
+  // BEFORE the per-page check (which would otherwise loop them through denied
+  // redirects, since officers have no reviewer pages).
+  if (profile.role === 'officer') {
+    location.replace('https://learn.360aor.com');
+    throw new Error('officer → trainer (training-only role)');
+  }
+
   if (!can(profile.role, pageKey)) {
     location.replace('dashboard.html?err=denied');
     throw new Error('role denied');
