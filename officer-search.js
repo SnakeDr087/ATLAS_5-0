@@ -5,6 +5,9 @@
 // elements exist anywhere in ATLAS 5 — that dead-code pattern caused v4.3's
 // worst bug.
 //
+// Behavior: clicking/focusing the box shows the FULL roster (scrollable,
+// alphabetical). Typing filters it down. No result cap.
+//
 // Usage:
 //   const os = new OfficerSearch(containerEl, {
 //     agencyId,                 // required
@@ -22,7 +25,7 @@ import { escHtml, escAttr, showError } from './error-handler.js';
 export class OfficerSearch {
   constructor(container, opts = {}) {
     this.container = container;
-    this.opts = { activeOnly: true, placeholder: 'Search officer by name or badge…', ...opts };
+    this.opts = { activeOnly: true, placeholder: 'Select or search officer by name or badge…', ...opts };
     this.officers = [];
     this.filtered = [];
     this.selected = null;
@@ -70,6 +73,10 @@ export class OfficerSearch {
     this.dropdown = this.container.querySelector('.os-dropdown');
     this.selectedEl = this.container.querySelector('.os-selected');
 
+    // Full roster can be open at once — make the dropdown scroll.
+    this.dropdown.style.maxHeight = '320px';
+    this.dropdown.style.overflowY = 'auto';
+
     this.input.addEventListener('input', () => this._filter());
     this.input.addEventListener('focus', () => this._filter());
     this.input.addEventListener('keydown', (e) => this._keys(e));
@@ -80,11 +87,12 @@ export class OfficerSearch {
 
   _filter() {
     const q = this.input.value.trim().toLowerCase();
+    // No result cap: empty query = the ENTIRE roster (browsable), typing filters.
     this.filtered = this.officers.filter((o) => {
       const name = `${o.first_name} ${o.last_name}`.toLowerCase();
       const rev = `${o.last_name} ${o.first_name}`.toLowerCase();
       return !q || name.includes(q) || rev.includes(q) || (o.badge_number || '').toLowerCase().includes(q);
-    }).slice(0, 12);
+    });
     this.highlight = this.filtered.length ? 0 : -1;
     this._paint();
   }
@@ -102,6 +110,9 @@ export class OfficerSearch {
       this.dropdown.querySelectorAll('.os-option').forEach((btn) => {
         btn.addEventListener('click', () => this._pick(this.filtered[Number(btn.dataset.i)]));
       });
+      // Keep the keyboard-highlighted row visible inside the scrolling list.
+      const hl = this.dropdown.querySelector('.os-option.hl');
+      if (hl) hl.scrollIntoView({ block: 'nearest' });
     }
     this.dropdown.hidden = false;
     this.input.setAttribute('aria-expanded', 'true');
