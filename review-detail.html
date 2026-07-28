@@ -20,7 +20,7 @@
     import { supabase } from './supabase-client.js';
     import {
       escHtml, escAttr, fmtDate, renderLoading, renderErrorState, renderEmpty,
-      showError, scoreClass, outcomeBadge,
+      showError, showToast, scoreClass, outcomeBadge,
     } from './error-handler.js';
 
     const content = document.getElementById('content');
@@ -30,16 +30,67 @@
     const id = new URLSearchParams(location.search).get('id');
     if (!id) { renderEmpty(content, 'No review specified', 'Open a review from the Reviews list.'); throw new Error('no id'); }
 
-    try {
+    // ------------------------------------------------------------------
+    // Amendment model: reviews are editable ONLY via the amend_review()
+    // database function, and only within 30 days of creation. Every
+    // amendment is permanently recorded (who/when/why, old → new).
+    // ------------------------------------------------------------------
+    const AMEND_WINDOW_DAYS = 30;
+
+    // v1 amendable fields — factual fields only. KPI answers / officer /
+    // outcome changes are v2 (they cascade into scoring and Delta T).
+    const AMENDABLE = [
+      { key: 'police_case_number', label: 'Police case #',      type: 'text' },
+      { key: 'review_date',        label: 'Review date',        type: 'date' },
+      { key: 'incident_date',      label: 'Incident date',      type: 'date' },
+      { key: 'recording_start',    label: 'Recording start',    type: 'time' },
+      { key: 'recording_end',      label: 'Recording end',      type: 'time' },
+      { key: 'loc_street',         label: 'Street',             type: 'text' },
+      { key: 'loc_apt',            label: 'Apt / suite',        type: 'text' },
+      { key: 'loc_floor',          label: 'Floor',              type: 'text' },
+      { key: 'loc_city',           label: 'City',               type: 'text' },
+      { key: 'loc_state',          label: 'State',              type: 'text' },
+      { key: 'report_notes',       label: 'Report-facing notes', type: 'textarea' },
+      { key: 'internal_notes',     label: 'Internal notes',      type: 'textarea' },
+    ];
+
+    async function loadReview() {
       const { data: r, error } = await supabase.from('bwc_reviews')
         .select(`*, personnel_roster:primary_officer_id (id, first_name, last_name, badge_number, agency_ranks:rank_id (rank_name)),
                  reviewer:reviewer_id (full_name), incident_types:incident_type_id (name),
                  agencies:agency_id (name, min_performance_threshold)`)
         .eq('id', id).maybeSingle();
       if (error) throw error;
-      if (!r) { renderEmpty(content, 'Review not found', 'It may not exist or you may not have access to it.'); throw new Error('not found'); }
+      return r;
+    }
 
+    async function loadAmendments() {
+      const { data, error } = await supabase.from('review_amendments')
+        .select('id, reason, changes, created_at, amended_by, profiles:amended_by (full_name)')
+        .eq('review_id', id)
+        .order('created_at', { ascending: false });
+      if (error) { console.warn('amendments load failed', error); return []; }
+      return data || [];
+    }
+
+    function fmtVal(v) {
+      if (v === null || v === undefined || v === '') return '—';
+      if (typeof v === 'object') return escHtml(JSON.stringify(v));
+      return escHtml(String(v));
+    }
+
+    async function render() {
+      renderLoading(content, 'Loading review…');
+      let r;
+      try { r = await loadReview(); } catch (e) { showError(e, 'Review detail'); renderErrorState(content); return; }
+      if (!r) { renderEmpty(content, 'Review not found', 'It may not exist or you may not have access to it.'); return; }
+
+      const amendments = await loadAmendments();
       const threshold = r.agencies?.min_performance_threshold ?? 80;
+
+      const ageDays = (Date.now() - new Date(r.created_at).getTime()) / 86400000;
+      const inWindow = ageDays <= AMEND_WINDOW_DAYS;
+      const daysLeft = Math.max(0, Math.ceil(AMEND_WINDOW_DAYS - ageDays));
 
       // Resolve KPI + safety item text for the stored ids.
       const kpiIds = Object.keys(r.kpi_responses || {}).filter((k) => k !== 'universal_assessment');
@@ -69,14 +120,69 @@
       const loc = [r.loc_street, r.loc_apt && `Apt ${r.loc_apt}`, r.loc_floor && `Fl ${r.loc_floor}`, r.loc_city, r.loc_state]
         .filter(Boolean).map(escHtml).join(', ') || '—';
 
+      const amendControl = inWindow
+        ? `<button class="btn btn-secondary btn-sm" id="amendBtn">Amend review</button>`
+        : `<span class="pill" title="Reviews lock ${AMEND_WINDOW_DAYS} days after creation">🔒 Sealed</span>`;
+
+      const amendedBanner = amendments.length
+        ? `<div class="card" style="border-left:4px solid var(--warning); padding:10px 16px; margin-bottom:16px;">
+             <strong>Amended record.</strong> This review has ${amendments.length} recorded amendment${amendments.length > 1 ? 's' : ''} — full history below. The original values are preserved in the amendment log.
+           </div>`
+        : '';
+
+      const historyCard = amendments.length ? `
+        <div class="card">
+          <h2 class="card-title">Amendment history</h2>
+          ${amendments.map((a) => `
+            <div style="border-bottom:1px solid var(--border); padding:10px 0;">
+              <div class="flex-between">
+                <strong>${escHtml(a.profiles?.full_name || 'Unknown user')}</strong>
+                <span class="text-muted">${new Date(a.created_at).toLocaleString()}</span>
+              </div>
+              <div style="margin:4px 0;"><em>Reason:</em> ${escHtml(a.reason)}</div>
+              ${(a.changes || []).map((c) => `
+                <div class="kpi-row">
+                  <span class="kpi-text">${escHtml((AMENDABLE.find((f) => f.key === c.field)?.label) || c.field)}</span>
+                  <span>${fmtVal(c.old)} → <strong>${fmtVal(c.new)}</strong></span>
+                </div>`).join('')}
+            </div>`).join('')}
+        </div>` : '';
+
       content.innerHTML = `
         <div class="flex-between" style="margin-bottom:16px;">
           <h2 style="margin:0;">${escHtml(r.atlas_case_number)}</h2>
           <span>
             ${outcomeBadge(r.follow_up_outcome)}
+            ${amendControl}
             <a class="btn btn-secondary btn-sm" href="review-report.html?id=${escAttr(r.id)}">Printable report</a>
             <a class="btn btn-secondary btn-sm" href="officer-profile.html?id=${escAttr(r.primary_officer_id)}">Officer profile</a>
           </span>
+        </div>
+
+        ${amendedBanner}
+
+        <div class="card" id="amendPanel" style="display:none; border-left:4px solid var(--accent);">
+          <h2 class="card-title">Amend review <span class="pill">${daysLeft} day${daysLeft === 1 ? '' : 's'} left in amendment window</span></h2>
+          <p class="text-muted" style="margin-top:0;">Change only what needs correcting. Every change is permanently recorded with your name, the date, your reason, and the original value.</p>
+          <div class="detail-grid">
+            ${AMENDABLE.map((f) => {
+              const cur = r[f.key] ?? '';
+              if (f.type === 'textarea') {
+                return `<div class="detail-item" style="grid-column:1 / -1;"><div class="dl">${escHtml(f.label)}</div>
+                        <textarea class="input" data-field="${escAttr(f.key)}" rows="3">${escHtml(cur)}</textarea></div>`;
+              }
+              return `<div class="detail-item"><div class="dl">${escHtml(f.label)}</div>
+                      <input class="input" type="${escAttr(f.type)}" data-field="${escAttr(f.key)}" value="${escAttr(cur)}" /></div>`;
+            }).join('')}
+          </div>
+          <div style="margin-top:12px;">
+            <div class="dl">Reason for amendment <span class="pill pill-danger">required</span></div>
+            <textarea class="input" id="amendReason" rows="2" placeholder="Why is this record being corrected? (e.g., 'Incident date entered incorrectly — verified against CAD.')"></textarea>
+          </div>
+          <div style="margin-top:12px;">
+            <button class="btn btn-primary" id="amendSave">Save amendment</button>
+            <button class="btn btn-secondary" id="amendCancel">Cancel</button>
+          </div>
         </div>
 
         <div class="card">
@@ -124,10 +230,48 @@
           ${r.internal_notes !== null && r.internal_notes !== undefined ? `
             <h3 style="margin:18px 0 6px;">Internal notes <span class="pill pill-danger">confidential — never printed</span></h3>
             <p style="white-space:pre-wrap;">${escHtml(r.internal_notes || '—')}</p>` : ''}
-        </div>`;
-    } catch (e) {
-      if (!['no id', 'not found'].includes(e.message)) { showError(e, 'Review detail'); renderErrorState(content); }
+        </div>
+
+        ${historyCard}`;
+
+      // ---- amendment panel wiring ----
+      const panel = document.getElementById('amendPanel');
+      const btn = document.getElementById('amendBtn');
+      if (btn) btn.addEventListener('click', () => { panel.style.display = ''; panel.scrollIntoView({ behavior: 'smooth' }); });
+      const cancel = document.getElementById('amendCancel');
+      if (cancel) cancel.addEventListener('click', () => { panel.style.display = 'none'; });
+
+      const save = document.getElementById('amendSave');
+      if (save) save.addEventListener('click', async () => {
+        const reason = document.getElementById('amendReason').value.trim();
+        if (reason.length < 5) { showToast('A reason for the amendment is required.', 'error'); return; }
+
+        // collect ONLY the fields that actually changed
+        const changes = {};
+        panel.querySelectorAll('[data-field]').forEach((el) => {
+          const key = el.dataset.field;
+          const orig = r[key] ?? '';
+          const val = el.value;
+          if (String(val) !== String(orig)) changes[key] = val === '' ? null : val;
+        });
+        if (!Object.keys(changes).length) { showToast('No changes to save.', 'error'); return; }
+
+        save.disabled = true;
+        try {
+          const { error } = await supabase.rpc('amend_review', {
+            p_review_id: id, p_changes: changes, p_reason: reason,
+          });
+          if (error) throw error;
+          showToast('Amendment saved and recorded.', 'success');
+          await render(); // re-render with fresh data + history
+        } catch (e) {
+          showError(e, 'Amendment failed');
+          save.disabled = false;
+        }
+      });
     }
+
+    await render();
   </script>
 </body>
 </html>
