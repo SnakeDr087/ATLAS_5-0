@@ -22,7 +22,7 @@ const ALL = ROLES;
 export const ROLE_PERMISSIONS = {
   dashboard:           ALL,
   reviews:             ['super_admin', 'chief', 'internal_affairs', 'training_bureau', 'agency_admin', 'supervisor'],
-  'review-new':        ['internal_affairs', 'training_bureau', 'supervisor'],
+  'review-new':        ['internal_affairs', 'training_bureau', 'agency_admin', 'supervisor'], // agency_admin added 2026-07-28 (small-agency authoring)
   'review-detail':     ['super_admin', 'chief', 'internal_affairs', 'training_bureau', 'agency_admin', 'supervisor'],
   'auto-select':       ['supervisor'],
   'delta-t':           ['super_admin', 'chief', 'internal_affairs', 'training_bureau', 'agency_admin', 'supervisor'],
