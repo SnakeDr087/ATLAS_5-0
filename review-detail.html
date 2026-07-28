@@ -20,8 +20,20 @@
     import { supabase } from './supabase-client.js';
     import {
       escHtml, escAttr, fmtDate, renderLoading, renderErrorState, renderEmpty,
-      showError, showToast, scoreClass, outcomeBadge,
+      showError, scoreClass, outcomeBadge,
     } from './error-handler.js';
+
+    // Self-contained toast (error-handler.js has no showToast export)
+    function showToast(msg, type = 'success') {
+      const t = document.createElement('div');
+      t.textContent = msg;
+      t.style.cssText = `position:fixed;bottom:24px;right:24px;z-index:9999;
+        padding:12px 18px;border-radius:8px;color:#fff;font-weight:600;
+        box-shadow:0 4px 14px rgba(0,0,0,.25);
+        background:${type === 'error' ? '#c0392b' : '#1e7e34'};`;
+      document.body.appendChild(t);
+      setTimeout(() => t.remove(), 3500);
+    }
 
     const content = document.getElementById('content');
     const { profile } = await bootPage('review-detail', 'Review Detail');
