@@ -92,10 +92,98 @@
       if (tab === 'incidents') renderIncidents(body);
       else if (tab === 'safety') renderSimpleList(body, {
         table: 'safety_checklist_items', type: 'safety_item',
-        textCol: 'item_text', title: 'Officer Safety Deficiency Items',
+        textCol: 'item_text', title: 'Officer Safety Items',
         hint: 'Shown as the collapsible safety checklist on every review.',
       });
       else renderDispositions(body);
+    }
+
+    // ---- General Performance (scope = universal) -----------------------------
+    async function renderUniversalPanel(body) {
+      const el = body.querySelector('#uni-list');
+      if (!el) return;
+      renderLoading(el, 'Loading…');
+      let rows;
+      try {
+        const { data, error } = await supabase.from('kpi_definitions')
+          .select('id, agency_id, key, kpi_text, sort_order, is_active')
+          .eq('scope', 'universal').order('sort_order');
+        if (error) throw error;
+        rows = (data || []).filter((r) => r.agency_id === null || r.agency_id === agencyId);
+      } catch (e) { showError(e, 'General Performance'); renderErrorState(el); return; }
+
+      if (!rows.length) { renderEmpty(el, 'None yet', 'Add an item that applies to every review.'); }
+      else {
+        el.innerHTML = `
+          <table class="table"><thead><tr>
+            <th style="width:60px;">Sort</th><th>Item</th><th style="width:170px;">Source</th><th style="width:210px;"></th>
+          </tr></thead><tbody>
+            ${rows.map((r) => `
+              <tr>
+                <td>${r.sort_order}</td>
+                <td>${escHtml(r.kpi_text)}${r.is_active ? '' : ' <span class="text-muted">(inactive)</span>'}</td>
+                <td>${rowBadges(r)}</td>
+                <td style="text-align:right;">
+                  ${canEditRow(r) ? `
+                    <button class="btn btn-secondary btn-sm" data-uni-edit="${escAttr(r.id)}">Edit</button>
+                    <button class="btn ${r.is_active ? 'btn-danger' : 'btn-success'} btn-sm" data-uni-toggle="${escAttr(r.id)}">${r.is_active ? 'Deactivate' : 'Reactivate'}</button>` : ''}
+                </td>
+              </tr>`).join('')}
+          </tbody></table>`;
+      }
+
+      el.querySelectorAll('[data-uni-edit]').forEach((b) => b.addEventListener('click', () => {
+        const r = rows.find((x) => x.id === b.dataset.uniEdit);
+        openTextModal({
+          title: 'Edit Item', label: 'Item text', value: r.kpi_text, textarea: true,
+          onSave: async (text) => {
+            const { error } = await supabase.from('kpi_definitions')
+              .update({ kpi_text: text, criterion: text }).eq('id', r.id);
+            if (error) throw error;
+            await logActivity(profile, 'kpi_edit', 'kpi_definitions', r.id, { scope: 'universal' });
+            toast('Item updated.', 'success');
+            renderUniversalPanel(body);
+          },
+        });
+      }));
+      el.querySelectorAll('[data-uni-toggle]').forEach((b) => b.addEventListener('click', async () => {
+        const r = rows.find((x) => x.id === b.dataset.uniToggle);
+        try {
+          const { error } = await supabase.from('kpi_definitions')
+            .update({ is_active: !r.is_active }).eq('id', r.id);
+          if (error) throw error;
+          await logActivity(profile, r.is_active ? 'kpi_deactivate' : 'kpi_reactivate', 'kpi_definitions', r.id, { scope: 'universal' });
+          renderUniversalPanel(body);
+        } catch (e) { showError(e, 'Update item'); }
+      }));
+
+      const addBtn = body.querySelector('#btn-add-uni');
+      if (addBtn) addBtn.addEventListener('click', () => openTextModal({
+        title: 'Add — General Performance', label: 'Item text', textarea: true,
+        onSave: async (text) => {
+          const { data, error } = await supabase.from('kpi_definitions').insert({
+            agency_id: editingBaseline ? null : agencyId,
+            key: slugKey(text, editingBaseline ? '' : 'agency'),
+            scope: 'universal', triggers: [],
+            kpi_text: text, criterion: text,
+            sort_order: (rows.length + 1) * 10,
+          }).select('id').single();
+          if (error) throw error;
+          await logActivity(profile, 'kpi_add', 'kpi_definitions', data.id, { scope: 'universal' });
+          toast('Item added.', 'success');
+          renderUniversalPanel(body);
+        },
+      }));
+    }
+
+    // ---- Keys ---------------------------------------------------------------
+    // Every content row carries a permanent snake_case key. Display text can be
+    // reworded later; the key never changes.
+    const CATEGORIES = ['administrative','crisis','enforcement','response','sensitive','service','traffic'];
+    function slugKey(text, prefix = '', max = 58) {
+      const base = String(text).toLowerCase().replace(/&/g, ' and ')
+        .replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').replace(/_+/g, '_');
+      return (prefix ? `${prefix}__${base}` : base).slice(0, max).replace(/_+$/, '');
     }
 
     // ---- Shared row actions ------------------------------------------------
@@ -151,7 +239,7 @@
       renderLoading(body, 'Loading incident types…');
       try {
         const { data, error } = await supabase.from('incident_types')
-          .select('id, agency_id, name, is_active, sort_order')
+          .select('id, agency_id, key, name, category, handling, is_active, sort_order')
           .order('sort_order').order('name');
         if (error) throw error;
         // Visible set: baseline + this agency's items (RLS narrows further).
@@ -163,6 +251,17 @@
       if (!selectedIncident && incidentTypes.length) selectedIncident = incidentTypes[0].id;
 
       body.innerHTML = `
+        <div class="card" style="margin-bottom:20px;">
+          <div class="flex-between">
+            <div>
+              <h3 class="card-title mb-0">General Performance</h3>
+              <p class="text-muted" style="margin:4px 0 0;">Shown on every review, whatever the incident type.</p>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btn-add-uni">Add</button>
+          </div>
+          <div id="uni-list" style="margin-top:12px;"></div>
+        </div>
+
         <div style="display:grid; grid-template-columns: 320px 1fr; gap:20px;">
           <div class="card">
             <div class="flex-between">
@@ -179,11 +278,15 @@
       body.querySelector('#btn-add-it').addEventListener('click', () => openTextModal({
         title: 'Add Incident Type',
         label: 'Incident type name',
-        onSave: async (name) => {
+        select: { label: 'Category', options: CATEGORIES, value: 'service' },
+        onSave: async (name, category) => {
+          const isBaseline = editingBaseline;
           const { data, error } = await supabase.from('incident_types').insert({
-            agency_id: editingBaseline && !agencyId ? null : (editingBaseline ? null : agencyId),
-            name, is_global_default: editingBaseline && !agencyId,
-            sort_order: incidentTypes.length + 1,
+            agency_id: isBaseline ? null : agencyId,
+            key: slugKey(name, isBaseline ? '' : 'agency'),
+            name, category, handling: 'standard',
+            is_global_default: isBaseline && !agencyId,
+            sort_order: (incidentTypes.length + 1) * 10,
           }).select('id').single();
           if (error) throw error;
           await logActivity(profile, 'incident_type_add', 'incident_types', data.id, { name });
@@ -191,6 +294,8 @@
           renderIncidents(body);
         },
       }));
+
+      renderUniversalPanel(body);
 
       const list = body.querySelector('#it-list');
       if (!incidentTypes.length) {
@@ -218,8 +323,8 @@
       let kpis;
       try {
         const { data, error } = await supabase.from('kpi_definitions')
-          .select('id, agency_id, kpi_text, sort_order, is_active')
-          .eq('incident_type_id', it.id)
+          .select('id, agency_id, key, kpi_text, criterion, scope, sort_order, is_active')
+          .contains('triggers', [it.key])
           .order('sort_order');
         if (error) throw error;
         kpis = (data || []).filter((r) => r.agency_id === null || r.agency_id === agencyId);
@@ -248,9 +353,12 @@
         title: `Add KPI — ${it.name}`, label: 'KPI text', textarea: true,
         onSave: async (text) => {
           const { data, error } = await supabase.from('kpi_definitions').insert({
-            incident_type_id: it.id,
             agency_id: editingBaseline ? null : agencyId,
-            kpi_text: text, sort_order: kpis.length + 1,
+            key: slugKey(text, it.key),
+            scope: 'conditional',
+            triggers: [it.key],
+            kpi_text: text, criterion: text,
+            sort_order: (kpis.length + 1) * 10,
           }).select('id').single();
           if (error) throw error;
           await logActivity(profile, 'kpi_add', 'kpi_definitions', data.id, { incident_type: it.name });
@@ -314,7 +422,7 @@
         b.addEventListener('click', () => openTextModal({
           title: 'Edit KPI', label: 'KPI text', value: k.kpi_text, textarea: true,
           onSave: async (text) => {
-            const { error } = await supabase.from('kpi_definitions').update({ kpi_text: text }).eq('id', k.id);
+            const { error } = await supabase.from('kpi_definitions').update({ kpi_text: text, criterion: text }).eq('id', k.id);
             if (error) throw error;
             await logActivity(profile, 'kpi_update', 'kpi_definitions', k.id, {});
             toast('KPI updated.', 'success');
@@ -374,7 +482,9 @@
         onSave: async (text) => {
           const { data, error } = await supabase.from(cfg.table).insert({
             agency_id: editingBaseline ? null : agencyId,
-            [cfg.textCol]: text, sort_order: rows.length + 1,
+            ...(cfg.table === 'safety_checklist_items'
+              ? { key: slugKey(text, editingBaseline ? '' : 'agency') } : {}),
+            [cfg.textCol]: text, sort_order: (rows.length + 1) * 10,
           }).select('id').single();
           if (error) throw error;
           await logActivity(profile, `${type}_add`, cfg.table, data.id, {});
@@ -566,7 +676,7 @@
     }
 
     // ---- Reusable single-text-field modal ---------------------------------
-    function openTextModal({ title, label, value = '', textarea = false, onSave }) {
+    function openTextModal({ title, label, value = '', textarea = false, select = null, onSave }) {
       const slot = document.getElementById('modal-slot');
       slot.innerHTML = `
         <div class="modal-backdrop">
@@ -578,6 +688,12 @@
                   ? `<textarea id="tm-value" rows="3">${escHtml(value)}</textarea>`
                   : `<input id="tm-value" value="${escAttr(value)}" />`}
               </div>
+              ${select ? `
+                <div><label class="field-label">${escHtml(select.label)} *</label>
+                  <select id="tm-select">
+                    ${select.options.map((o) => `<option value="${escAttr(o)}" ${o === select.value ? 'selected' : ''}>${escHtml(o)}</option>`).join('')}
+                  </select>
+                </div>` : ''}
             </div>
             <div class="flex-between" style="margin-top:16px;">
               <button class="btn btn-secondary" id="tm-cancel">Cancel</button>
@@ -592,7 +708,7 @@
         const btn = slot.querySelector('#tm-save');
         btn.disabled = true;
         try {
-          await onSave(text);
+          await onSave(text, select ? slot.querySelector('#tm-select').value : undefined);
           slot.innerHTML = '';
         } catch (e) {
           showError(e, title);
