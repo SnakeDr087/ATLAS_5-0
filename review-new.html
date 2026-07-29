@@ -36,7 +36,6 @@
     let incidentTypes = [], universalKpis = [], safetyItems = [], dispositions = [];
     let kpisForType = [];              // current incident type's KPI list
     const kpiState = {};               // kpi_id -> observed/not_observed/na
-    let universalPick = null;
     let outcomePick = 'no_action';
     let receiptId = null;
     let primaryOS, backupOS;
@@ -47,7 +46,7 @@
     try {
       [incidentTypes, universalKpis, safetyItems, dispositions] = await Promise.all([
         getEffectiveContent('incident_type', agencyId),
-        getEffectiveContent('kpi', agencyId, (q) => q.is('incident_type_id', null)),
+        getEffectiveContent('kpi', agencyId, (q) => q.eq('scope', 'universal')),
         getEffectiveContent('safety_item', agencyId),
         getEffectiveContent('disposition', agencyId),
       ]);
@@ -123,16 +122,6 @@
             </select>
           </div>
           <div id="kpi-block"><p class="text-muted">Select an incident type to load its KPI checklist.</p></div>
-
-          <h3 style="margin:24px 0 6px;">Universal Performance Assessment *</h3>
-          <p class="text-secondary" style="margin:0 0 10px;font-size:13px;">Single overall rating — shown on every review.</p>
-          <div id="universal-block">
-            ${universalKpis.map((k) => `
-              <label class="check-item" style="padding:5px 0;">
-                <input type="radio" name="universal" value="${escAttr(k.id)}" />
-                <span>${escHtml(k.kpi_text)}</span>
-              </label>`).join('')}
-          </div>
 
           <div style="margin-top:24px;border:1px solid var(--border);border-radius:10px;padding:14px 16px;">
             <div class="collapse-head" id="safety-toggle">
@@ -217,10 +206,6 @@
         badge.hidden = n === 0; badge.textContent = String(n);
       }));
 
-      // Universal single-select
-      content.querySelectorAll('input[name="universal"]').forEach((r) =>
-        r.addEventListener('change', () => { universalPick = r.value; }));
-
       // Outcome cards
       document.getElementById('outcome-grid').querySelectorAll('.outcome-card').forEach((card) => {
         card.addEventListener('click', () => {
@@ -268,7 +253,12 @@
       if (!typeId) { block.innerHTML = '<p class="text-muted">Select an incident type to load its KPI checklist.</p>'; return; }
       renderLoading(block, 'Loading KPIs…');
       try {
-        kpisForType = await getEffectiveContent('kpi', agencyId, (q) => q.eq('incident_type_id', typeId));
+        const typeKey = (incidentTypes.find((t) => t.id === typeId) || {}).key;
+        const conditional = typeKey
+          ? await getEffectiveContent('kpi', agencyId, (q) => q.contains('triggers', [typeKey]))
+          : [];
+        // Universal KPIs show on every review, then the incident-specific ones.
+        kpisForType = [...universalKpis, ...conditional];
         if (!kpisForType.length) { block.innerHTML = '<p class="text-muted">No KPIs are defined for this incident type.</p>'; return; }
         block.innerHTML = `
           <div class="flex-between" style="margin-bottom:6px;">
@@ -333,7 +323,6 @@
       if (!typeId) return toast('Select an incident type.', 'error');
       const unanswered = kpisForType.filter((k) => !kpiState[k.id]);
       if (unanswered.length) return toast(`Answer all KPIs — ${unanswered.length} remaining.`, 'error');
-      if (!universalPick) return toast('Select a Universal Performance Assessment rating.', 'error');
       if (!reportNotes) return toast('Report-facing notes are required.', 'error');
 
       // Same-rank rule (agency setting) — supervisors only.
@@ -373,7 +362,7 @@
           loc_city: document.getElementById('f-city').value.trim() || null,
           loc_state: document.getElementById('f-state').value || null,
           incident_type_id: typeId,
-          kpi_responses: { ...kpiState, universal_assessment: universalPick },
+          kpi_responses: { ...kpiState },
           safety_checklist: safetyChecklist,
           dispositions: dispCodes,
           kpi_score: score,
