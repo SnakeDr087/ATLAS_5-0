@@ -123,9 +123,21 @@
           </div>
           <div id="kpi-block"><p class="text-muted">Select an incident type to load its KPI checklist.</p></div>
 
+          <h3 style="margin:24px 0 6px;">General Performance</h3>
+          <p class="text-secondary" style="margin:0 0 10px;font-size:13px;">Applies to every incident type.</p>
+          <div id="universal-block">
+            ${universalKpis.map((k) => `
+              <div class="kpi-row" data-kpi="${escAttr(k.id)}">
+                <span class="kpi-text">${escHtml(k.kpi_text)}</span>
+                <span class="tri-group">
+                  ${STATES.map((st) => `<button type="button" class="tri-btn" data-state="${st}">${STATE_LABEL[st]}</button>`).join('')}
+                </span>
+              </div>`).join('')}
+          </div>
+
           <div style="margin-top:24px;border:1px solid var(--border);border-radius:10px;padding:14px 16px;">
             <div class="collapse-head" id="safety-toggle">
-              <h3 class="mb-0 mt-0">Officer Safety Deficiencies <span class="pill pill-danger" id="safety-count" hidden>0</span></h3>
+              <h3 class="mb-0 mt-0">Officer Safety Items <span class="pill pill-danger" id="safety-count" hidden>0</span></h3>
               <span class="text-muted" id="safety-chevron">▸ expand</span>
             </div>
             <div id="safety-body" hidden>
@@ -206,6 +218,12 @@
         badge.hidden = n === 0; badge.textContent = String(n);
       }));
 
+      // Universal KPI rows use the same tri-state control as the type list.
+      document.getElementById('universal-block').querySelectorAll('.kpi-row').forEach((row) => {
+        row.querySelectorAll('.tri-btn').forEach((b) =>
+          b.addEventListener('click', () => setKpi(row, b.dataset.state)));
+      });
+
       // Outcome cards
       document.getElementById('outcome-grid').querySelectorAll('.outcome-card').forEach((card) => {
         card.addEventListener('click', () => {
@@ -257,8 +275,7 @@
         const conditional = typeKey
           ? await getEffectiveContent('kpi', agencyId, (q) => q.contains('triggers', [typeKey]))
           : [];
-        // Universal KPIs show on every review, then the incident-specific ones.
-        kpisForType = [...universalKpis, ...conditional];
+        kpisForType = conditional;
         if (!kpisForType.length) { block.innerHTML = '<p class="text-muted">No KPIs are defined for this incident type.</p>'; return; }
         block.innerHTML = `
           <div class="flex-between" style="margin-bottom:6px;">
@@ -321,7 +338,7 @@
 
       if (!officer) return toast('Select a primary officer.', 'error');
       if (!typeId) return toast('Select an incident type.', 'error');
-      const unanswered = kpisForType.filter((k) => !kpiState[k.id]);
+      const unanswered = [...universalKpis, ...kpisForType].filter((k) => !kpiState[k.id]);
       if (unanswered.length) return toast(`Answer all KPIs — ${unanswered.length} remaining.`, 'error');
       if (!reportNotes) return toast('Report-facing notes are required.', 'error');
 
