@@ -76,7 +76,7 @@
         <div class="tabs">
           <button class="tab ${tab === 'incidents' ? 'active' : ''}" data-tab="incidents">Incident Types & KPIs</button>
           <button class="tab ${tab === 'safety' ? 'active' : ''}" data-tab="safety">Safety Checklist</button>
-          <button class="tab ${tab === 'dispositions' ? 'active' : ''}" data-tab="dispositions">Dispositions</button>
+          <button class="tab ${tab === 'dispositions' ? 'active' : ''}" data-tab="dispositions">Follow Up Actions</button>
         </div>
         <div id="tab-body" style="margin-top:20px;"></div>
         <div id="modal-slot"></div>`;
@@ -562,17 +562,17 @@
         if (error) throw error;
         rows = (data || []).filter((r) => r.agency_id === null || r.agency_id === agencyId);
       } catch (e) {
-        showError(e, 'Dispositions'); renderErrorState(body); return;
+        showError(e, 'Follow Up Actions'); renderErrorState(body); return;
       }
 
       body.innerHTML = `
         <div class="card">
           <div class="flex-between">
             <div>
-              <h3 class="card-title mb-0">Disposition Types</h3>
+              <h3 class="card-title mb-0">Follow Up Actions</h3>
               <p class="text-muted" style="margin:4px 0 0;">Codes are stable identifiers stored on reviews — never change a code once in use; deactivate and add a new one instead.</p>
             </div>
-            <button class="btn btn-primary btn-sm" id="btn-add-disp">Add Disposition</button>
+            <button class="btn btn-primary btn-sm" id="btn-add-disp">Add Follow Up Action</button>
           </div>
           <div id="disp-list" style="margin-top:14px;"></div>
         </div>`;
@@ -616,7 +616,7 @@
               .update({ is_active: !r.is_active }).eq('id', r.id);
             if (error) throw error;
             await logActivity(profile, 'disposition_toggle', 'disposition_types', r.id, { active: !r.is_active });
-            toast('Disposition updated.', 'success');
+            toast('Follow up action updated.', 'success');
             renderDispositions(body);
           } catch (e) { showError(e, 'Update disposition'); }
         });
@@ -632,7 +632,7 @@
         slot.innerHTML = `
           <div class="modal-backdrop">
             <div class="modal">
-              <h3 class="card-title">${isEdit ? 'Edit Disposition' : 'Add Disposition'}</h3>
+              <h3 class="card-title">${isEdit ? 'Edit Follow Up Action' : 'Add Follow Up Action'}</h3>
               <div class="form-grid">
                 <div class="form-row">
                   <div><label class="field-label">Code *</label>
@@ -668,7 +668,7 @@
               await logActivity(profile, 'disposition_add', 'disposition_types', data.id, { code, label });
             }
             slot.innerHTML = '';
-            toast('Disposition saved.', 'success');
+            toast('Follow up action saved.', 'success');
             renderDispositions(body);
           } catch (e) { showError(e, 'Save disposition'); }
         });
