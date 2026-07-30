@@ -43,6 +43,7 @@
     const backups = [];                // {id, first_name, last_name, badge_number}
     let sameRankRule = true;
     let submitting = false;
+    let agencyState = '';              // agencies.state — default for Incident Location
 
     try {
       [incidentTypes, universalKpis, safetyItems, dispositions] = await Promise.all([
@@ -54,6 +55,12 @@
       const { data: srp } = await supabase.from('same_rank_permissions')
         .select('allow_same_rank').eq('agency_id', agencyId).maybeSingle();
       if (srp) sameRankRule = srp.allow_same_rank;
+
+      // Incident-location state defaults to the agency's own state.
+      // Resolved from agencyId (not profile.agency) so super_admin agency-context works.
+      const { data: ag } = await supabase.from('agencies')
+        .select('state').eq('id', agencyId).maybeSingle();
+      agencyState = (ag?.state || profile.agency?.state || '').trim().toUpperCase();
       renderForm();
     } catch (e) {
       showError(e, 'New review');
@@ -94,7 +101,16 @@
             <div><label class="field-label">Floor</label><input type="text" id="f-floor" /></div>
             <div><label class="field-label">City</label><input type="text" id="f-city" /></div>
             <div><label class="field-label">State</label>
-              <select id="f-state"><option value="">—</option>${US_STATES.map((s) => `<option${s === (profile.agency?.state || '') ? ' selected' : ''}>${s}</option>`).join('')}</select>
+              <select id="f-state"${agencyState ? ' disabled' : ''}>
+                <option value="">—</option>
+                ${US_STATES.map((s) => `<option${s === agencyState ? ' selected' : ''}>${s}</option>`).join('')}
+              </select>
+              ${agencyState ? `
+              <div id="state-lock-note" style="margin-top:6px;font-size:12px;">
+                <span class="text-muted">Agency state — applied automatically.</span>
+                <button type="button" id="state-unlock" class="link-btn"
+                        style="background:none;border:0;padding:0;margin-left:6px;color:var(--accent);cursor:pointer;font-size:12px;text-decoration:underline;">Change</button>
+              </div>` : ''}
             </div>
           </div>
         </div>
@@ -202,6 +218,18 @@
       });
 
       // Incident type → KPI list
+      // State lock — unlock only for out-of-state incidents (mutual aid, pursuits, etc.)
+      const stateUnlock = document.getElementById('state-unlock');
+      if (stateUnlock) {
+        stateUnlock.addEventListener('click', () => {
+          const sel = document.getElementById('f-state');
+          sel.disabled = false;
+          sel.focus();
+          document.getElementById('state-lock-note').innerHTML =
+            '<span class="text-muted">Out-of-state incident — state unlocked.</span>';
+        });
+      }
+
       document.getElementById('f-incident-type').addEventListener('change', loadKpis);
 
       // Safety collapsible + count badge
