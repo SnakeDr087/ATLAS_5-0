@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -249,7 +250,7 @@ footer .fbrand span{font-family:var(--display);letter-spacing:.12em;font-weight:
     <div class="hero-cta">
       <a class="btn btn-steel" href="contact.html">Request a Demo</a>
     </div>
-    <p class="hero-proof">OBJECTIVE REVIEW &nbsp;·&nbsp; RANDOMIZED SELECTION &nbsp;·&nbsp; DELTA&nbsp;T INTERVENTION &nbsp;·&nbsp; BUILT-IN SUPERVISORY AUDIT</p>
+    <p class="hero-proof">OBJECTIVE REVIEW &nbsp;&middot;&nbsp; RANDOMIZED SELECTION &nbsp;&middot;&nbsp; DELTA&nbsp;T INTERVENTION &nbsp;&middot;&nbsp; BUILT-IN SUPERVISORY AUDIT</p>
 
   </div>
 </section>
@@ -291,10 +292,11 @@ footer .fbrand span{font-family:var(--display);letter-spacing:.12em;font-weight:
       <h2 class="section-title">From The Stop To The Record</h2>
       <p class="section-lede">Body-worn camera footage is where performance actually lives — ATLAS is how an agency learns from it. Supervisors review real incidents against objective standards, gaps become tracked corrections, strong work becomes recognition, and leadership sees whether training, supervision, and policy are producing results. Watch one incident make the full journey — from the stop to the record.</p>
     </div>
-    <!-- Hero video: drop atlas-hero.mp4 (and optional atlas-hero-poster.jpg) in the site root.
-         When the file is present the video shows and the CSS mock below hides automatically. -->
+    <!-- Hero video: plays atlas-hero.mp4 from the site root if present; otherwise falls back
+         to the CDN copy. ATLAS HOST cannot upload the mp4 (browser-storage quota), so the CDN
+         source is the one that actually serves today. -->
     <div class="video-stage" id="videoStage">
-      <video id="heroVideo" autoplay muted loop playsinline preload="metadata" aria-label="ATLAS product video">
+      <video id="heroVideo" autoplay muted loop playsinline preload="metadata" poster="atlas-hero-poster.jpg" aria-label="ATLAS product video">
         <source src="atlas-hero.mp4" type="video/mp4">
         <source src="https://d8j0ntlcm91z4.cloudfront.net/user_3F4yJl8w7KPvXdCn3ikmHRTFM8j/hf_20260725_112835_795b9e79-acbe-42c5-bba5-55db5073f9eb.mp4" type="video/mp4">
       </video>
@@ -390,6 +392,7 @@ footer .fbrand span{font-family:var(--display);letter-spacing:.12em;font-weight:
 </section>
 
 
+<!-- ============ SECURITY & TRUST ============ -->
 <!-- ============ ORGANIZATIONAL AUDIT ============ -->
 <section class="pillars audit-feature" id="audit">
   <div class="wrap">
@@ -415,12 +418,11 @@ footer .fbrand span{font-family:var(--display);letter-spacing:.12em;font-weight:
         <p>Discrepancies become findings with footage citations, corrective instruction from a standardized list, timestamped supervisor acknowledgment, and a recorded disposition. Reviewed &#8594; found &#8594; instructed &#8594; acknowledged &#8594; closed &#8212; every verb has a record.</p>
       </div>
     </div>
-    <div class="loop-note reveal" style="margin-top:34px;"><strong style="color:var(--steel-300)">Records without verification protect no one.</strong> An audited review program is the difference between a system of record and a stack of assumptions &#8212; and it is the answer to the question every deposition eventually asks: did anyone check, and what did you do about what you found?</div>
+    <div class="loop-note reveal" style="margin-top:34px;border-left:4px solid var(--steel-400);background:rgba(13,23,38,.04);color:inherit;"><strong style="color:var(--steel-400)">Records without verification protect no one.</strong> An audited review program is the difference between a system of record and a stack of assumptions &#8212; and it is the answer to the question every deposition eventually asks: did anyone check, and what did you do about what you found?</div>
   </div>
 </section>
 
 
-<!-- ============ SECURITY & TRUST ============ -->
 <section class="trust" id="trust">
   <div class="wrap">
     <div class="section-head">
@@ -457,12 +459,12 @@ footer .fbrand span{font-family:var(--display);letter-spacing:.12em;font-weight:
 <section class="founder" id="founder">
   <div class="wrap founder-inner">
     <p class="eyebrow">From The Founder</p>
-    <img class="founder-photo" src="atlas-logo.png" alt="Chief Jonathan Parham in dress uniform" width="132" height="132">
+    <img class="founder-photo" src="founder-parham.png" alt="Chief Jonathan Parham in dress uniform" width="132" height="132">
     <h2 class="founder-name">Jonathan Parham</h2>
     <p class="founder-title">Chief of Police (ret)</p>
     <p class="founder-copy">ATLAS wasn&#8217;t built to catch officers doing something wrong — it was built to make good officers better. Three decades of law enforcement leadership taught me that performance is a system: training, supervision, and policy are the inputs; what happens on the street is the output; officer safety, sound policing, and service to the community are the outcomes. ATLAS works backwards from performance — surfacing gaps early, before they settle in as &#8220;the way it&#8217;s done,&#8221; and correcting them before a small deficiency grows into a serious event. And when the results aren&#8217;t there, it shows an agency where to look: at its training, its supervision, and its policy — not just its people.</p>
     <div class="founder-links">
-      <a class="btn-linkedin" href="https://www.linkedin.com/in/YOUR-PROFILE" rel="me noopener" target="_blank" aria-label="Jonathan Parham on LinkedIn">
+      <a class="btn-linkedin" href="https://www.linkedin.com/in/jonathanrparham/" rel="me noopener" target="_blank" aria-label="Jonathan Parham on LinkedIn">
         <svg viewBox="0 0 24 24"><path d="M20.45 20.45h-3.55v-5.57c0-1.33-.03-3.04-1.85-3.04-1.86 0-2.14 1.45-2.14 2.94v5.67H9.35V9h3.41v1.56h.05c.47-.9 1.63-1.85 3.36-1.85 3.6 0 4.27 2.37 4.27 5.45v6.29zM5.34 7.43a2.06 2.06 0 1 1 0-4.12 2.06 2.06 0 0 1 0 4.12zM7.12 20.45H3.56V9h3.56v11.45z"/></svg>
         Connect on LinkedIn
       </a>
@@ -497,14 +499,16 @@ footer .fbrand span{font-family:var(--display);letter-spacing:.12em;font-weight:
 
 <script>
 // Hero video swap: show the video only once real data loads; otherwise keep the CSS mock.
+// NOTE: do NOT hide on an individual <source> error — the first source (local atlas-hero.mp4)
+// is expected to fail so the CDN source can take over. Only the video-level error means
+// every source failed.
 (function(){
   const v = document.getElementById('heroVideo');
   const vs = document.getElementById('videoStage');
   const ms = document.getElementById('mockStage');
   if(!v) return;
   v.addEventListener('loadeddata', () => { vs.style.display='block'; ms.style.display='none'; });
-  v.addEventListener('error', () => { vs.style.display='none'; }, true);
-  v.querySelector('source').addEventListener('error', () => { vs.style.display='none'; });
+  v.addEventListener('error', () => { vs.style.display='none'; });
 })();
 
 // Scroll reveal (respects reduced motion via CSS)
