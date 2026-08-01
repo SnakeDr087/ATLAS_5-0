@@ -98,6 +98,7 @@ const DISPOSITIONS = [
 ];
 
 let kpiTextById = {};       // kpi_definitions id -> kpi_text
+let kpiScopeById = {};      // kpi_definitions id -> scope (universal vs incident)
 let safetyTextById = {};    // safety_checklist_items id -> item_text
 let measures = [];          // effective corrective measures for this agency
 let currentAuditId = new URLSearchParams(location.search).get('audit') || null;
@@ -123,11 +124,20 @@ async function loadMeasures() {
 
 async function loadContentText() {
   const [{ data: kpis }, { data: safety }] = await Promise.all([
-    supabase.from('kpi_definitions').select('id, kpi_text'),
+    supabase.from('kpi_definitions').select('id, kpi_text, scope'),
     supabase.from('safety_checklist_items').select('id, item_text'),
   ]);
-  (kpis || []).forEach((k) => { kpiTextById[k.id] = k.kpi_text; });
+  (kpis || []).forEach((k) => { kpiTextById[k.id] = k.kpi_text; kpiScopeById[k.id] = k.scope; });
   (safety || []).forEach((s) => { safetyTextById[s.id] = s.item_text; });
+}
+function isUniversalKpi(key) {
+  const s = kpiScopeById[key];
+  return key === 'universal_assessment' || (s && String(s).toLowerCase().includes('universal'));
+}
+function splitKpiKeys(keys) {
+  const incident = [], universal = [];
+  (keys || []).forEach((k) => (isUniversalKpi(k) ? universal : incident).push(k));
+  return { incident, universal };
 }
 function kpiText(key) { return kpiTextById[key] || (key === 'universal_assessment' ? 'Universal Performance Assessment' : key); }
 function safetyText(key) { return safetyTextById[key] || key; }
@@ -318,13 +328,8 @@ function renderScoring(el) {
     return;
   }
   const keys = ws.kpi_keys || [];
-  el.innerHTML = `
-    <div class="notice notice-warning no-print" style="margin:0 0 18px;"><strong>Blind audit in progress.</strong>
-      The supervisor\u2019s marks, score, and outcome are withheld by the database until you complete and lock your independent assessment. Locking is one-way.</div>
-    ${incidentCard()}
-    <div class="card"><h2 class="card-title mt-0">Independent KPI Assessment</h2>
-      <p class="card-sub">Opportunity first, then evidence, then performance — Article 01 order. Watch the same footage the supervisor reviewed, then mark each item.</p>
-      <div id="kpi-list">${keys.map((k) => `
+  const split = splitKpiKeys(keys);
+  const kpiRowHtml = (k) => `
         <div class="kpi-row" data-key="${escAttr(k)}">
           <div class="kpi-text">${escHtml(kpiText(k))}</div>
           <div class="tri-group">
@@ -332,8 +337,19 @@ function renderScoring(el) {
             <button type="button" class="tri-btn" data-mark="not_observed">Not Observed</button>
             <button type="button" class="tri-btn" data-mark="na">N/A</button>
           </div>
-        </div>`).join('')}</div>
+        </div>`;
+  el.innerHTML = `
+    <div class="notice notice-warning no-print" style="margin:0 0 18px;"><strong>Blind audit in progress.</strong>
+      The supervisor\u2019s marks, score, and outcome are withheld by the database until you complete and lock your independent assessment. Locking is one-way.</div>
+    ${incidentCard()}
+    <div class="card"><h2 class="card-title mt-0">Independent KPI Assessment — ${escHtml((ws.incident || {}).incident_type_name || 'Incident')}</h2>
+      <p class="card-sub">Opportunity first, then evidence, then performance — Article 01 order. Watch the same footage the supervisor reviewed, then mark each item.</p>
+      <div id="kpi-list">${split.incident.map(kpiRowHtml).join('')}</div>
     </div>
+    ${split.universal.length ? `<div class="card"><h2 class="card-title mt-0">Universal Performance Assessment</h2>
+      <p class="card-sub">Shown on every review regardless of incident type. The supervisor coded these too — they are part of the coding under audit.</p>
+      <div id="kpi-list-universal">${split.universal.map(kpiRowHtml).join('')}</div>
+    </div>` : ''}
     <div class="card"><h2 class="card-title mt-0">Officer Safety Deficiencies</h2>
       <p class="card-sub">Check any observed on the footage.</p>
       <div class="check-grid" id="safety-list">${Object.keys(safetyTextById).map((id) => `
@@ -415,12 +431,18 @@ async function renderReveal(el) {
   html.push(`<div class="card"><h2 class="card-title mt-0">Side-by-Side — Supervisor vs. Auditor</h2>
     <p class="card-sub">The original review is never altered. Every mismatch below became a finding automatically at lock.</p>
     <div class="diff-row diff-head"><div>Item</div><div>Supervisor</div><div>Auditor</div><div>Match</div></div>`);
-  Object.keys(supK).forEach((k) => {
+  const diffSplit = splitKpiKeys(Object.keys(supK));
+  const diffRow = (k, label) => {
     const s = supK[k]; const a = audK[k]; const ok = s === a;
-    html.push(`<div class="diff-row${ok ? '' : ' mismatch'}"><div>${escHtml(kpiText(k))}</div>
+    html.push(`<div class="diff-row${ok ? '' : ' mismatch'}"><div>${label ? label + ': ' : ''}${escHtml(kpiText(k))}</div>
       <div>${markPill(s)}</div><div>${markPill(a)}</div>
       <div>${ok ? '<span class="pill pill-success">\u2713</span>' : '<span class="pill pill-danger">\u2717</span>'}</div></div>`);
-  });
+  };
+  diffSplit.incident.forEach((k) => diffRow(k, ''));
+  if (diffSplit.universal.length) {
+    html.push(`<div class="diff-row diff-head" style="margin-top:6px;"><div>Universal Performance Assessment</div><div></div><div></div><div></div></div>`);
+    diffSplit.universal.forEach((k) => diffRow(k, ''));
+  }
   const safetyKeys = [...new Set([...Object.keys(supS), ...Object.keys(audS)])];
   safetyKeys.forEach((k) => {
     const s = !!supS[k]; const a = !!audS[k]; const ok = s === a;
