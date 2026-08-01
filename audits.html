@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Review Audits · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="atlas-logo.png" />
+  <style>
+    /* Page-local styles — audit workspace pieces not in the global system */
+    .receipt-box { background: #f8fafc; border: 1px dashed #b9c6da; border-radius: 10px;
+      padding: 14px 16px; font-family: ui-monospace, Consolas, monospace; font-size: 12.5px;
+      white-space: pre-wrap; line-height: 1.6; }
+    .diff-row { display: grid; grid-template-columns: 1fr 140px 140px 70px; gap: 10px;
+      padding: 9px 4px; border-bottom: 1px solid var(--border); font-size: 13.5px; align-items: center; }
+    .diff-row:last-child { border-bottom: none; }
+    .diff-head { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); font-weight: 600; border-bottom: 1px solid var(--border); }
+    .diff-row.mismatch { background: var(--danger-dim); border-radius: 7px; }
+    .find-box { border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
+      margin-bottom: 14px; background: var(--bg-elevated); }
+    .find-box.f-issued { border-left: 4px solid var(--warning); }
+    .find-box.f-acknowledged { border-left: 4px solid var(--accent); }
+    .find-box.f-closed { border-left: 4px solid var(--success); }
+    .find-tmpl { background: #f8fafc; border: 1px solid var(--border); border-radius: 8px;
+      padding: 12px 14px; font-size: 13.5px; line-height: 1.7; margin: 10px 0; }
+    .find-tmpl b { background: #fff3cd; padding: 0 3px; border-radius: 3px; }
+    .cm-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+    .cm-opt { border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px;
+      font-size: 12.5px; cursor: pointer; background: var(--bg-elevated); font-family: var(--font-body); }
+    .cm-opt.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .chain { border-left: 3px solid var(--accent); margin: 12px 0 4px 7px; padding-left: 18px; }
+    .chain-step { position: relative; padding-bottom: 14px; }
+    .chain-step::before { content: ""; position: absolute; left: -26.5px; top: 3px; width: 11px;
+      height: 11px; border-radius: 50%; background: var(--accent); border: 3px solid var(--bg-elevated);
+      box-shadow: 0 0 0 1px var(--accent); }
+    .chain-t { font-weight: 600; font-size: 13.5px; }
+    .chain-d { font-size: 12.5px; color: var(--text-secondary); }
+    .ts-input { width: 110px; font-family: ui-monospace, Consolas, monospace; }
+    .queue-meta { font-size: 12.5px; color: var(--text-muted); }
+    @media print {
+      #sidebar, #topbar, .tabs, .no-print, #audit-genie-btn, #audit-genie { display: none !important; }
+      .content { max-width: none; padding: 0; }
+      .card { box-shadow: none; border: none; padding: 0 0 16px; }
+      body { background: #fff; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <aside id="sidebar"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main class="content">
+      <div class="tabs no-print" id="audit-tabs">
+        <button class="tab active" data-tab="queue">Audit Queue</button>
+        <button class="tab" data-tab="workspace" id="tab-workspace" style="display:none;">Workspace</button>
+        <button class="tab" data-tab="records">Records &amp; Receipts</button>
+      </div>
+      <div id="view-queue"></div>
+      <div id="view-workspace" style="display:none;"></div>
+      <div id="view-records" style="display:none;"></div>
+    </main>
+  </div>
+</div>
+
+<script type="module">
+import { bootPage } from './auth.js';
+import { supabase, logActivity } from './supabase-client.js';
+import {
+  escHtml, escAttr, toast, showError, renderLoading, renderEmpty, renderErrorState,
+  fmtDate, fmtDateTime, outcomeLabel, outcomeBadge, scoreClass,
+} from './error-handler.js';
+import { mountAuditGenie, setAuditGenieContext } from './audit-genie.js';
+
+// ---------------------------------------------------------------------------
+// Boot + agency context (resolveAgencyId pattern — super_admin uses ?agency_id=)
+// ---------------------------------------------------------------------------
+const { profile } = await bootPage('audits', 'Review Audits');
+const agencyId = profile.agency_id || new URLSearchParams(location.search).get('agency_id');
+const readOnly = profile.role !== 'agency_admin' && profile.role !== 'super_admin';
+// super_admin is oversight-read here too: audits are conducted by the agency admin.
+const canConduct = profile.role === 'agency_admin';
+
+mountAuditGenie('dashboard');
+
+const OUTCOMES = ['no_action', 'commendation', 'coaching', 'training', 'internal_affairs', 'pip'];
+const OUTCOME_DESC = {
+  no_action: 'Met expectations', commendation: 'Exceptional performance', coaching: 'Verbal guidance',
+  training: 'Formal training', internal_affairs: 'IA referral', pip: 'Improvement plan',
+};
+const MARK_LABEL = { observed: 'Observed', not_observed: 'Not Observed', na: 'N/A',
+  identified: 'Identified', not_identified: 'Not identified' };
+const DISPOSITIONS = [
+  ['sustained', 'Sustained'],
+  ['supervisor_favor', 'Resolved in supervisor\u2019s favor'],
+  ['de_minimis', 'Variance de minimis'],
+];
+
+let kpiTextById = {};       // kpi_definitions id -> kpi_text
+let safetyTextById = {};    // safety_checklist_items id -> item_text
+let measures = [];          // effective corrective measures for this agency
+let currentAuditId = new URLSearchParams(location.search).get('audit') || null;
+
+// ---------------------------------------------------------------------------
+// Effective corrective measures — baseline + agency layer, minus suppressions.
+// (Same model as supabase-client's getEffectiveContent; local because the
+// content table map there predates this content type.)
+// ---------------------------------------------------------------------------
+async function loadMeasures() {
+  const { data: rows, error } = await supabase.from('corrective_measures')
+    .select('*').eq('is_active', true).order('sort_order');
+  if (error) throw error;
+  let suppressed = new Set();
+  if (agencyId) {
+    const { data: sup } = await supabase.from('content_suppressions')
+      .select('content_id').eq('agency_id', agencyId).eq('content_type', 'corrective_measure');
+    suppressed = new Set((sup || []).map((s) => s.content_id));
+  }
+  measures = (rows || []).filter((r) =>
+    r.agency_id === null ? !suppressed.has(r.id) : r.agency_id === agencyId);
+}
+
+async function loadContentText() {
+  const [{ data: kpis }, { data: safety }] = await Promise.all([
+    supabase.from('kpi_definitions').select('id, kpi_text'),
+    supabase.from('safety_checklist_items').select('id, item_text'),
+  ]);
+  (kpis || []).forEach((k) => { kpiTextById[k.id] = k.kpi_text; });
+  (safety || []).forEach((s) => { safetyTextById[s.id] = s.item_text; });
+}
+function kpiText(key) { return kpiTextById[key] || (key === 'universal_assessment' ? 'Universal Performance Assessment' : key); }
+function safetyText(key) { return safetyTextById[key] || key; }
+function measureLabel(code) { return (measures.find((m) => m.code === code) || {}).label || code; }
+
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+const tabs = document.getElementById('audit-tabs');
+tabs.addEventListener('click', (e) => {
+  const b = e.target.closest('.tab'); if (!b) return;
+  showTab(b.dataset.tab);
+});
+function showTab(name) {
+  tabs.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
+  for (const v of ['queue', 'workspace', 'records']) {
+    document.getElementById('view-' + v).style.display = v === name ? '' : 'none';
+  }
+  setAuditGenieContext(name === 'queue' ? 'dashboard' : name === 'records' ? 'records' : 'scoring');
+  if (name === 'queue') loadQueue();
+  if (name === 'records') loadRecords();
+}
+
+// ===========================================================================
+// VIEW 1 — QUEUE (cycle status + risk table + open-cycle)
+// ===========================================================================
+async function loadQueue() {
+  const el = document.getElementById('view-queue');
+  if (!agencyId) { renderEmpty(el, 'Select an agency', 'Use the agency selector above to choose an audit context.'); return; }
+  renderLoading(el, 'Loading audit queue\u2026');
+  try {
+    const since = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+    const [{ data: cycles }, { data: sups }, { data: recentReviews }] = await Promise.all([
+      supabase.from('audit_cycles').select('*').eq('agency_id', agencyId).order('created_at', { ascending: false }).limit(1),
+      supabase.from('profiles').select('id, full_name, is_active, review_exempt').eq('agency_id', agencyId).eq('role', 'supervisor'),
+      supabase.from('bwc_reviews').select('reviewer_id, follow_up_outcome').eq('agency_id', agencyId)
+        .eq('status', 'approved').gte('review_date', since),
+    ]);
+    const cycle = (cycles || [])[0] || null;
+
+    let audits = [];
+    if (cycle) {
+      const { data } = await supabase.from('review_audits').select('*').eq('cycle_id', cycle.id).order('audit_number');
+      audits = data || [];
+    }
+    const supName = Object.fromEntries((sups || []).map((s) => [s.id, s.full_name]));
+
+    // Risk profile: No Action rate per supervisor across the 90-day window
+    const stats = {};
+    (recentReviews || []).forEach((r) => {
+      const s = (stats[r.reviewer_id] = stats[r.reviewer_id] || { total: 0, na: 0 });
+      s.total += 1; if (r.follow_up_outcome === 'no_action') s.na += 1;
+    });
+    const totalReviews = (recentReviews || []).length;
+    const totalNA = (recentReviews || []).filter((r) => r.follow_up_outcome === 'no_action').length;
+    const baseline = totalReviews ? Math.round((totalNA / totalReviews) * 100) : 0;
+
+    const openCount = audits.filter((a) => a.status !== 'closed').length;
+    const html = [];
+
+    html.push(`<div class="stat-grid">
+      <div class="stat"><div class="stat-value">${cycle ? escHtml(cycle.cycle_label) : '—'}</div><div class="stat-label">Current cycle</div></div>
+      <div class="stat ${openCount ? 'warning' : 'success'}"><div class="stat-value">${audits.length ? `${audits.length - openCount}/${audits.length}` : '—'}</div><div class="stat-label">Audits closed</div></div>
+      <div class="stat"><div class="stat-value">${cycle ? fmtDate(cycle.due_on) : '—'}</div><div class="stat-label">Cycle due</div></div>
+      <div class="stat"><div class="stat-value">${baseline}%</div><div class="stat-label">Agency No Action rate (90d)</div></div>
+    </div>`);
+
+    // Cycle queue
+    html.push(`<div class="card"><div class="flex-between"><h2 class="card-title mt-0">Audit Queue${cycle ? ' — ' + escHtml(cycle.cycle_label) : ''}</h2>
+      ${canConduct && (!cycle || cycle.status === 'closed') ? `<button class="btn btn-primary" id="open-cycle-btn">Open ${escHtml(nextCycleLabel())} Cycle</button>` : ''}</div>`);
+    if (!cycle) {
+      html.push(`<p class="card-sub">No audit cycle has been opened yet. Opening a cycle runs the census selection — every eligible supervisor, one review drawn at random, receipt written before any scoring.</p>`);
+    } else if (!audits.length) {
+      html.push(`<p class="card-sub">Cycle open, no audits found.</p>`);
+    } else {
+      html.push(`<div class="table-wrap"><table class="data"><thead><tr>
+        <th>Audit</th><th>Supervisor</th><th>Review</th><th>Status</th><th>Concurrence</th><th></th></tr></thead><tbody>`);
+      audits.forEach((a) => {
+        const snap = a.review_snapshot || {};
+        html.push(`<tr class="rowlink" data-audit="${escAttr(a.id)}">
+          <td><strong>${escHtml(a.audit_number)}</strong></td>
+          <td>${escHtml(supName[a.supervisor_id] || '—')}</td>
+          <td>${escHtml(snap.atlas_case_number || '—')} <span class="queue-meta">${escHtml(snap.incident_type_name || '')}</span></td>
+          <td>${statusPill(a.status)}</td>
+          <td>${a.concurrence_pct === null || a.concurrence_pct === undefined ? '<span class="score-none">—</span>' : `<span class="${scoreClass(a.concurrence_pct)}">${escHtml(a.concurrence_pct)}%</span>`}</td>
+          <td><button class="btn btn-sm btn-secondary">Open</button></td></tr>`);
+      });
+      html.push('</tbody></table></div>');
+    }
+    html.push('</div>');
+
+    // Supervisor risk profile
+    html.push(`<div class="card"><h2 class="card-title mt-0">Supervisor Risk Profile</h2>
+      <p class="card-sub">No Action rate vs. the agency baseline (${baseline}%). Census model: every eligible supervisor is audited each cycle; this table is context, and the Chief's read on review performance.</p>
+      <div class="table-wrap"><table class="data"><thead><tr>
+        <th>Supervisor</th><th>Reviews (90d)</th><th>No Action rate</th><th>Eligibility</th></tr></thead><tbody>`);
+    (sups || []).forEach((s) => {
+      const st = stats[s.id] || { total: 0, na: 0 };
+      const rate = st.total ? Math.round((st.na / st.total) * 100) : null;
+      let elig;
+      if (!s.is_active) elig = '<span class="pill">Inactive</span>';
+      else if (s.review_exempt) elig = '<span class="pill">Exempt — administrative assignment</span>';
+      else if (!st.total) elig = '<span class="pill pill-danger">Expected to review — none in window</span>';
+      else elig = '<span class="pill pill-success">In pool</span>';
+      html.push(`<tr><td><strong>${escHtml(s.full_name)}</strong></td><td>${st.total}</td>
+        <td>${rate === null ? '<span class="score-none">—</span>' : `<span class="${rate >= 65 ? 'score-bad' : rate >= 50 ? 'score-warn' : 'score-good'}">${rate}%</span>`}</td>
+        <td>${elig}</td></tr>`);
+    });
+    html.push('</tbody></table></div></div>');
+
+    el.innerHTML = html.join('');
+    el.querySelectorAll('tr[data-audit]').forEach((tr) =>
+      tr.addEventListener('click', () => openWorkspace(tr.dataset.audit)));
+    const ocb = document.getElementById('open-cycle-btn');
+    if (ocb) ocb.addEventListener('click', openCycle);
+  } catch (e) { showError(e, 'Audit queue'); renderErrorState(el); }
+}
+
+function statusPill(s) {
+  const map = { selected: 'pill', scoring: 'pill pill-accent', revealed: 'pill pill-accent',
+    issued: 'pill pill-warning', acknowledged: 'pill pill-warning', closed: 'pill pill-success' };
+  const lbl = { selected: 'Awaiting blind score', scoring: 'Scoring', revealed: 'Findings drafted',
+    issued: 'Awaiting acknowledgment', acknowledged: 'Awaiting disposition', closed: 'Closed' };
+  return `<span class="${map[s] || 'pill'}">${escHtml(lbl[s] || s)}</span>`;
+}
+function nextCycleLabel() {
+  const d = new Date();
+  return `Q${Math.floor(d.getMonth() / 3) + 1} ${d.getFullYear()}`;
+}
+
+async function openCycle() {
+  const label = nextCycleLabel();
+  if (!confirm(`Open the ${label} audit cycle?\n\nThis runs the census selection now: one approved review drawn at random for every eligible supervisor, with a permanent receipt written for each before any scoring.`)) return;
+  try {
+    const { data, error } = await supabase.rpc('open_audit_cycle', { p_agency_id: agencyId, p_cycle_label: label });
+    if (error) throw error;
+    toast(`${label} cycle opened — ${data.audits_created} audit(s) created, receipts written.`);
+    loadQueue();
+  } catch (e) { showError(e, 'Open cycle'); }
+}
+
+// ===========================================================================
+// VIEW 2 — WORKSPACE (blind scoring OR reveal/findings, by audit status)
+// ===========================================================================
+let ws = null;          // workspace payload from get_audit_workspace
+let auditorKpi = {};    // key -> mark
+let auditorSafety = {}; // id -> bool
+let auditorOutcome = null;
+
+async function openWorkspace(auditId) {
+  currentAuditId = auditId;
+  document.getElementById('tab-workspace').style.display = '';
+  showTab('workspace');
+  const el = document.getElementById('view-workspace');
+  renderLoading(el, 'Opening audit workspace\u2026');
+  try {
+    const { data, error } = await supabase.rpc('get_audit_workspace', { p_audit_id: auditId });
+    if (error) throw error;
+    ws = data;
+    auditorKpi = {}; auditorSafety = {}; auditorOutcome = null;
+    if (!ws.locked_at) renderScoring(el); else await renderReveal(el);
+  } catch (e) { showError(e, 'Workspace'); renderErrorState(el); }
+}
+
+function incidentCard() {
+  const i = ws.incident || {};
+  return `<div class="card"><h2 class="card-title mt-0">${escHtml(ws.audit_number)} — Audited Review</h2>
+    <div class="detail-grid">
+      <div class="detail-item"><div class="dl">ATLAS case</div><div class="dv">${escHtml(i.atlas_case_number || '—')}</div></div>
+      <div class="detail-item"><div class="dl">Supervisor</div><div class="dv">${escHtml(ws.supervisor_name || '—')}</div></div>
+      <div class="detail-item"><div class="dl">Officer</div><div class="dv">${escHtml(ws.officer_name || '—')}</div></div>
+      <div class="detail-item"><div class="dl">Incident type</div><div class="dv">${escHtml(i.incident_type_name || '—')}</div></div>
+      <div class="detail-item"><div class="dl">Incident date</div><div class="dv">${escHtml(fmtDate(i.incident_date))}</div></div>
+      <div class="detail-item"><div class="dl">Recording</div><div class="dv">${escHtml(i.recording_start || '—')} \u2013 ${escHtml(i.recording_end || '—')}</div></div>
+      <div class="detail-item"><div class="dl">Location</div><div class="dv">${escHtml([i.loc_street, i.loc_city, i.loc_state].filter(Boolean).join(', ') || '—')}</div></div>
+    </div>
+    <details style="margin-top:14px;"><summary class="text-secondary" style="cursor:pointer;font-size:13px;">Selection receipt</summary>
+      <div class="receipt-box" style="margin-top:10px;">${escHtml(ws.selection_receipt)}</div></details>
+  </div>`;
+}
+
+// ---- Blind scoring --------------------------------------------------------
+function renderScoring(el) {
+  setAuditGenieContext('scoring');
+  if (!canConduct) {
+    el.innerHTML = incidentCard() +
+      `<div class="notice notice-warning">This audit has not been scored yet. Blind scoring is conducted by the agency administrator; the supervisor\u2019s marks remain withheld until the assessment is locked.</div>`;
+    return;
+  }
+  const keys = ws.kpi_keys || [];
+  el.innerHTML = `
+    <div class="notice notice-warning no-print" style="margin:0 0 18px;"><strong>Blind audit in progress.</strong>
+      The supervisor\u2019s marks, score, and outcome are withheld by the database until you complete and lock your independent assessment. Locking is one-way.</div>
+    ${incidentCard()}
+    <div class="card"><h2 class="card-title mt-0">Independent KPI Assessment</h2>
+      <p class="card-sub">Opportunity first, then evidence, then performance — Article 01 order. Watch the same footage the supervisor reviewed, then mark each item.</p>
+      <div id="kpi-list">${keys.map((k) => `
+        <div class="kpi-row" data-key="${escAttr(k)}">
+          <div class="kpi-text">${escHtml(kpiText(k))}</div>
+          <div class="tri-group">
+            <button type="button" class="tri-btn" data-mark="observed">Observed</button>
+            <button type="button" class="tri-btn" data-mark="not_observed">Not Observed</button>
+            <button type="button" class="tri-btn" data-mark="na">N/A</button>
+          </div>
+        </div>`).join('')}</div>
+    </div>
+    <div class="card"><h2 class="card-title mt-0">Officer Safety Deficiencies</h2>
+      <p class="card-sub">Check any observed on the footage.</p>
+      <div class="check-grid" id="safety-list">${Object.keys(safetyTextById).map((id) => `
+        <label class="check-item"><input type="checkbox" data-safety="${escAttr(id)}"> ${escHtml(safetyTextById[id])}</label>`).join('')}</div>
+    </div>
+    <div class="card"><h2 class="card-title mt-0">Follow-Up Outcome — Your Independent Selection</h2>
+      <div class="outcome-grid" id="outcome-grid">${OUTCOMES.map((o) => `
+        <button type="button" class="outcome-card oc-${escAttr(o)}" data-outcome="${escAttr(o)}">
+          <span class="oc-name">${escHtml(outcomeLabel(o))}</span>
+          <span class="oc-desc">${escHtml(OUTCOME_DESC[o])}</span>
+        </button>`).join('')}</div>
+      <div class="form-row" style="margin-top:16px;">
+        <label class="field-label" for="auditor-notes">Auditor notes (on the audit record)</label>
+        <textarea id="auditor-notes" placeholder="Assessment basis, footage observations, timestamps to cite\u2026"></textarea>
+      </div>
+      <button class="btn btn-primary" id="lock-btn">Complete &amp; Lock — Reveal Supervisor\u2019s Marks</button>
+      <span class="text-muted" style="font-size:12.5px;margin-left:8px;">One-way. Your assessment becomes part of the permanent record.</span>
+    </div>`;
+
+  el.querySelectorAll('.kpi-row .tri-btn').forEach((b) => b.addEventListener('click', () => {
+    const row = b.closest('.kpi-row');
+    auditorKpi[row.dataset.key] = b.dataset.mark;
+    row.querySelectorAll('.tri-btn').forEach((x) => x.className = 'tri-btn' + (x === b ? ' sel-' + b.dataset.mark : ''));
+  }));
+  el.querySelectorAll('[data-safety]').forEach((c) => c.addEventListener('change', () => {
+    auditorSafety[c.dataset.safety] = c.checked;
+  }));
+  el.querySelectorAll('.outcome-card').forEach((c) => c.addEventListener('click', () => {
+    auditorOutcome = c.dataset.outcome;
+    el.querySelectorAll('.outcome-card').forEach((x) => x.classList.toggle('selected', x === c));
+  }));
+  document.getElementById('lock-btn').addEventListener('click', lockScoring);
+}
+
+async function lockScoring() {
+  const keys = ws.kpi_keys || [];
+  const missing = keys.filter((k) => !auditorKpi[k]);
+  if (missing.length) { toast(`Mark all KPIs before locking (${missing.length} remaining).`, 'error'); return; }
+  if (!auditorOutcome) { toast('Select your independent follow-up outcome before locking.', 'error'); return; }
+  if (!confirm('Lock your assessment? This is one-way — the supervisor\u2019s marks will be revealed and findings auto-drafted from every discrepancy.')) return;
+  try {
+    const safety = {}; Object.keys(auditorSafety).forEach((k) => { if (auditorSafety[k]) safety[k] = true; });
+    const { data, error } = await supabase.rpc('lock_audit_scoring', {
+      p_audit_id: currentAuditId, p_kpi: auditorKpi, p_safety: safety,
+      p_outcome: auditorOutcome, p_notes: document.getElementById('auditor-notes').value || null,
+    });
+    if (error) throw error;
+    toast(`Assessment locked — ${data.concurrence_pct}% concurrence, ${data.findings_drafted} finding(s) drafted.`);
+    openWorkspace(currentAuditId);
+  } catch (e) { showError(e, 'Lock'); }
+}
+
+// ---- Reveal & findings ----------------------------------------------------
+let findings = [];
+
+async function renderReveal(el) {
+  setAuditGenieContext('reveal');
+  const { data, error } = await supabase.from('audit_findings')
+    .select('*').eq('audit_id', currentAuditId).order('finding_number');
+  if (error) throw error;
+  findings = data || [];
+
+  const sup = ws.supervisor_assessment || {};
+  const aud = ws.auditor_assessment || {};
+  const supK = sup.kpi_responses || {}; const audK = aud.kpi_responses || {};
+  const supS = sup.safety_checklist || {}; const audS = aud.safety_checklist || {};
+  const closed = ws.status === 'closed';
+
+  const html = [];
+  html.push(`<div class="stat-grid">
+    <div class="stat ${Number(aud.concurrence_pct) >= 80 ? 'success' : 'danger'}"><div class="stat-value">${escHtml(aud.concurrence_pct)}%</div><div class="stat-label">KPI concurrence</div></div>
+    <div class="stat ${aud.outcome_match ? 'success' : 'danger'}"><div class="stat-value">${aud.outcome_match ? 'Match' : 'Mismatch'}</div><div class="stat-label">Outcome concurrence</div></div>
+    <div class="stat"><div class="stat-value">${findings.length}</div><div class="stat-label">Findings</div></div>
+    <div class="stat"><div class="stat-value">${statusPill(ws.status)}</div><div class="stat-label">Audit status</div></div>
+  </div>`);
+  html.push(incidentCard());
+
+  // Side-by-side diff
+  html.push(`<div class="card"><h2 class="card-title mt-0">Side-by-Side — Supervisor vs. Auditor</h2>
+    <p class="card-sub">The original review is never altered. Every mismatch below became a finding automatically at lock.</p>
+    <div class="diff-row diff-head"><div>Item</div><div>Supervisor</div><div>Auditor</div><div>Match</div></div>`);
+  Object.keys(supK).forEach((k) => {
+    const s = supK[k]; const a = audK[k]; const ok = s === a;
+    html.push(`<div class="diff-row${ok ? '' : ' mismatch'}"><div>${escHtml(kpiText(k))}</div>
+      <div>${markPill(s)}</div><div>${markPill(a)}</div>
+      <div>${ok ? '<span class="pill pill-success">\u2713</span>' : '<span class="pill pill-danger">\u2717</span>'}</div></div>`);
+  });
+  const safetyKeys = [...new Set([...Object.keys(supS), ...Object.keys(audS)])];
+  safetyKeys.forEach((k) => {
+    const s = !!supS[k]; const a = !!audS[k]; const ok = s === a;
+    html.push(`<div class="diff-row${ok ? '' : ' mismatch'}"><div>Safety: ${escHtml(safetyText(k))}</div>
+      <div>${markPill(s ? 'identified' : 'not_identified')}</div><div>${markPill(a ? 'identified' : 'not_identified')}</div>
+      <div>${ok ? '<span class="pill pill-success">\u2713</span>' : '<span class="pill pill-danger">\u2717</span>'}</div></div>`);
+  });
+  const oMatch = aud.outcome_match;
+  html.push(`<div class="diff-row${oMatch ? '' : ' mismatch'}"><div><strong>Follow-Up Outcome</strong></div>
+    <div>${outcomeBadge(sup.follow_up_outcome)}</div><div>${outcomeBadge(aud.outcome)}</div>
+    <div>${oMatch ? '<span class="pill pill-success">\u2713</span>' : '<span class="pill pill-danger">\u2717</span>'}</div></div>`);
+  html.push('</div>');
+
+  // Findings
+  html.push(`<div class="card"><h2 class="card-title mt-0">Findings &amp; Corrective Measures</h2>`);
+  if (!findings.length) {
+    if (ws.status === 'revealed' && canConduct) {
+      html.push(`<div class="notice notice-warning" style="margin-bottom:14px;background:var(--success-dim);color:var(--success);border-color:var(--success);">Full concurrence — no findings. Close this audit as a concurrence record.</div>
+        <button class="btn btn-success no-print" id="close-concurrence-btn">Close as Concurrence</button>`);
+    } else {
+      html.push('<p class="card-sub">Full concurrence — no findings on this audit.</p>');
+    }
+  } else {
+    findings.forEach((f) => html.push(findingBox(f)));
+    if (ws.status === 'revealed' && canConduct) {
+      html.push(`<button class="btn btn-primary no-print" id="issue-btn">Issue All Findings to Supervisor</button>
+        <span class="text-muted no-print" style="font-size:12.5px;margin-left:8px;">Every finding needs footage timestamps and at least one corrective measure. Acknowledgment is required and timestamped.</span>`);
+    }
+    if (ws.status === 'acknowledged' && canConduct) {
+      html.push(`<button class="btn btn-success no-print" id="close-audit-btn">Close Audit — Finalize Record</button>
+        <span class="text-muted no-print" style="font-size:12.5px;margin-left:8px;">Requires a disposition on every finding. Closed records are permanent and read-only.</span>`);
+    }
+  }
+  html.push('</div>');
+  el.innerHTML = html.join('');
+
+  // Wire editors
+  if (ws.status === 'revealed' && canConduct) {
+    el.querySelectorAll('[data-ts]').forEach((inp) => inp.addEventListener('change', async () => {
+      const { error: e } = await supabase.from('audit_findings')
+        .update({ [inp.dataset.ts]: inp.value || null }).eq('id', inp.dataset.fid);
+      if (e) showError(e, 'Timestamp');
+    }));
+    el.querySelectorAll('[data-comment]').forEach((inp) => inp.addEventListener('change', async () => {
+      const { error: e } = await supabase.from('audit_findings')
+        .update({ auditor_comment: inp.value || null }).eq('id', inp.dataset.comment);
+      if (e) showError(e, 'Comment');
+    }));
+    el.querySelectorAll('.cm-opt[data-measure]').forEach((btn) => btn.addEventListener('click', async () => {
+      const f = findings.find((x) => x.id === btn.dataset.fid);
+      const set = new Set(f.corrective_measures || []);
+      set.has(btn.dataset.measure) ? set.delete(btn.dataset.measure) : set.add(btn.dataset.measure);
+      f.corrective_measures = [...set];
+      const { error: e } = await supabase.from('audit_findings')
+        .update({ corrective_measures: f.corrective_measures }).eq('id', f.id);
+      if (e) { showError(e, 'Measures'); return; }
+      btn.classList.toggle('on');
+    }));
+    const ib = document.getElementById('issue-btn'); if (ib) ib.addEventListener('click', issueFindings);
+    const cc = document.getElementById('close-concurrence-btn'); if (cc) cc.addEventListener('click', closeConcurrence);
+  }
+  if (ws.status === 'acknowledged' && canConduct) {
+    el.querySelectorAll('[data-dispo]').forEach((sel) => sel.addEventListener('change', async () => {
+      const { error: e } = await supabase.from('audit_findings')
+        .update({ disposition: sel.value || null }).eq('id', sel.dataset.dispo);
+      if (e) { showError(e, 'Disposition'); return; }
+      const f = findings.find((x) => x.id === sel.dataset.dispo);
+      if (f) f.disposition = sel.value || null;
+    }));
+    const cb = document.getElementById('close-audit-btn'); if (cb) cb.addEventListener('click', closeAudit);
+  }
+}
+
+function markPill(m) {
+  const cls = { observed: 'pill pill-success', not_observed: 'pill pill-danger', na: 'pill',
+    identified: 'pill pill-danger', not_identified: 'pill' }[m] || 'pill';
+  return `<span class="${cls}">${escHtml(MARK_LABEL[m] || m || '—')}</span>`;
+}
+
+function findingText(f) {
+  const typeName = escHtml((ws.incident || {}).incident_type_name || 'unspecified');
+  const ts = `<b>${escHtml(f.footage_ts_from || '00:00:00')} \u2013 ${escHtml(f.footage_ts_to || '00:00:00')}</b>`;
+  if (f.finding_type === 'outcome') {
+    return `Outcome discrepancy noted on review <b>${escHtml((ws.incident || {}).atlas_case_number || '')}</b> (incident type <b>${typeName}</b>). In my independent assessment I selected <b>${escHtml(outcomeLabel(f.auditor_value))}</b>; the supervisor selected <b>${escHtml(outcomeLabel(f.supervisor_value))}</b>. Supporting footage: ${ts}.`;
+  }
+  if (f.finding_type === 'safety') {
+    return `Officer-safety discrepancy noted: <b>${escHtml(safetyText(f.safety_item_id || ''))}</b>, related to incident type <b>${typeName}</b>. In my observations this deficiency was <b>${escHtml(MARK_LABEL[f.auditor_value] || f.auditor_value)}</b>; the supervisor recorded it as <b>${escHtml(MARK_LABEL[f.supervisor_value] || f.supervisor_value)}</b>. The evidence of my review is located at ${ts}.`;
+  }
+  return `The following discrepancy was noted: <b>${escHtml(kpiText(f.kpi_id || ''))}</b>, related to incident type <b>${typeName}</b>. In my observations I saw <b>${escHtml(MARK_LABEL[f.auditor_value] || f.auditor_value)}</b>; the supervisor coded it as <b>${escHtml(MARK_LABEL[f.supervisor_value] || f.supervisor_value)}</b>. The evidence of my review is located at ${ts}.`;
+}
+
+function findingBox(f) {
+  const editable = ws.status === 'revealed' && canConduct;
+  const typePill = f.finding_type === 'outcome' ? 'pill pill-warning' : f.finding_type === 'safety' ? 'pill pill-danger' : 'pill pill-accent';
+  const typeLbl = f.finding_type === 'outcome' ? 'Outcome discrepancy' : f.finding_type === 'safety' ? 'Safety discrepancy' : 'KPI discrepancy';
+  let h = `<div class="find-box f-${escAttr(f.status)}"><div class="flex-between">
+    <div><strong>${escHtml(f.finding_number)}</strong> <span class="${typePill}">${typeLbl}</span></div>
+    <span class="pill">${escHtml(f.status)}</span></div>
+    <div class="find-tmpl">${findingText(f)}</div>`;
+  if (editable) {
+    h += `<div class="filter-bar" style="margin-bottom:8px;">
+      <div><label class="field-label">Footage from</label><input type="text" class="ts-input" placeholder="00:00:00" value="${escAttr(f.footage_ts_from || '')}" data-ts="footage_ts_from" data-fid="${escAttr(f.id)}"></div>
+      <div><label class="field-label">Footage to</label><input type="text" class="ts-input" placeholder="00:00:00" value="${escAttr(f.footage_ts_to || '')}" data-ts="footage_ts_to" data-fid="${escAttr(f.id)}"></div>
+    </div>
+    <label class="field-label">Corrective measures (standardized list)</label>
+    <div class="cm-list">${measures.map((m) => `
+      <button type="button" class="cm-opt${(f.corrective_measures || []).includes(m.code) ? ' on' : ''}" data-measure="${escAttr(m.code)}" data-fid="${escAttr(f.id)}">${escHtml(m.label)}</button>`).join('')}</div>
+    <div class="form-row" style="margin-top:12px;">
+      <label class="field-label">Auditor comment (optional)</label>
+      <input type="text" value="${escAttr(f.auditor_comment || '')}" data-comment="${escAttr(f.id)}" placeholder="Additional context for the supervisor\u2026"></div>`;
+  } else {
+    h += `<div style="font-size:13px;">
+      <label class="field-label">Corrective measures issued</label>
+      ${(f.corrective_measures || []).length ? '<ul style="margin:4px 0 10px 18px;">' + f.corrective_measures.map((c) => `<li>${escHtml(measureLabel(c))}</li>`).join('') + '</ul>' : '<span class="text-muted">None</span>'}
+      ${f.auditor_comment ? `<label class="field-label">Auditor comment</label><p style="margin:2px 0 10px;">${escHtml(f.auditor_comment)}</p>` : ''}
+      ${f.acknowledged_at ? `<label class="field-label">Supervisor acknowledgment</label><p style="margin:2px 0 6px;">Acknowledged ${escHtml(fmtDateTime(f.acknowledged_at))}${f.supervisor_response ? '' : ' <span class="text-muted">(no response attached)</span>'}</p>` : ''}
+      ${f.supervisor_response ? `<div class="find-tmpl" style="margin-top:4px;"><em>Supervisor response:</em> ${escHtml(f.supervisor_response)}</div>` : ''}
+    </div>`;
+    if (ws.status === 'acknowledged' && canConduct) {
+      h += `<label class="field-label" style="margin-top:8px;">Disposition (closure)</label>
+        <select data-dispo="${escAttr(f.id)}" style="max-width:320px;">
+          <option value="">— select —</option>
+          ${DISPOSITIONS.map(([v, l]) => `<option value="${escAttr(v)}"${f.disposition === v ? ' selected' : ''}>${escHtml(l)}</option>`).join('')}
+        </select>`;
+    } else if (f.disposition) {
+      const dl = Object.fromEntries(DISPOSITIONS);
+      h += `<label class="field-label" style="margin-top:8px;">Disposition</label>
+        <span class="${f.disposition === 'sustained' ? 'pill pill-warning' : 'pill pill-success'}">${escHtml(dl[f.disposition] || f.disposition)}</span>`;
+    }
+  }
+  h += '</div>';
+  return h;
+}
+
+async function issueFindings() {
+  const noTs = findings.filter((f) => !f.footage_ts_from || !f.footage_ts_to);
+  // Refresh timestamp state from inputs (change events may not have fired yet)
+  document.querySelectorAll('[data-ts]').forEach((inp) => {
+    const f = findings.find((x) => x.id === inp.dataset.fid);
+    if (f) f[inp.dataset.ts] = inp.value || null;
+  });
+  const missTs = findings.filter((f) => !f.footage_ts_from || !f.footage_ts_to);
+  if (missTs.length) { toast(`Enter footage timestamps on every finding first (${missTs.length} missing).`, 'error'); return; }
+  const missCm = findings.filter((f) => !(f.corrective_measures || []).length);
+  if (missCm.length) { toast(`Select at least one corrective measure on every finding (${missCm.length} missing).`, 'error'); return; }
+  if (!confirm(`Issue ${findings.length} finding(s) to ${ws.supervisor_name}? Each requires timestamped acknowledgment.`)) return;
+  try {
+    // Persist any unpersisted timestamps, then flip statuses
+    for (const f of findings) {
+      const { error: e1 } = await supabase.from('audit_findings').update({
+        footage_ts_from: f.footage_ts_from, footage_ts_to: f.footage_ts_to,
+        status: 'issued', issued_at: new Date().toISOString(),
+      }).eq('id', f.id);
+      if (e1) throw e1;
+    }
+    const { error: e2 } = await supabase.from('review_audits')
+      .update({ status: 'issued' }).eq('id', currentAuditId);
+    if (e2) throw e2;
+    await logActivity(profile, 'findings_issued', 'review_audit', currentAuditId,
+      { audit: ws.audit_number, findings: findings.length, supervisor_id: ws.supervisor_id });
+    toast(`${findings.length} finding(s) issued to ${ws.supervisor_name}.`);
+    openWorkspace(currentAuditId);
+  } catch (e) { showError(e, 'Issue findings'); }
+}
+
+async function closeConcurrence() {
+  if (!confirm('Close this audit as a full-concurrence record?')) return;
+  try {
+    const { error } = await supabase.from('review_audits')
+      .update({ status: 'closed', closed_at: new Date().toISOString() }).eq('id', currentAuditId);
+    if (error) throw error;
+    await logActivity(profile, 'audit_closed', 'review_audit', currentAuditId,
+      { audit: ws.audit_number, result: 'concurrence' });
+    toast('Audit closed as concurrence and written to the record.');
+    showTab('records');
+  } catch (e) { showError(e, 'Close audit'); }
+}
+
+async function closeAudit() {
+  const missing = findings.filter((f) => !f.disposition);
+  if (missing.length) { toast(`Record a disposition on every finding first (${missing.length} missing).`, 'error'); return; }
+  if (!confirm('Close this audit and finalize the record? Closed records are permanent and read-only.')) return;
+  try {
+    for (const f of findings) {
+      const { error: e1 } = await supabase.from('audit_findings')
+        .update({ status: 'closed', closed_at: new Date().toISOString() }).eq('id', f.id);
+      if (e1) throw e1;
+      await logActivity(profile, 'finding_disposed', 'audit_finding', f.id,
+        { finding: f.finding_number, disposition: f.disposition });
+    }
+    const { error: e2 } = await supabase.from('review_audits')
+      .update({ status: 'closed', closed_at: new Date().toISOString() }).eq('id', currentAuditId);
+    if (e2) throw e2;
+    await logActivity(profile, 'audit_closed', 'review_audit', currentAuditId,
+      { audit: ws.audit_number, findings: findings.length });
+    toast('Audit closed. Full record available in Records & Receipts.');
+    showTab('records');
+  } catch (e) { showError(e, 'Close audit'); }
+}
+
+// ===========================================================================
+// VIEW 3 — RECORDS & RECEIPTS (searchable permanent vault)
+// ===========================================================================
+let recordRows = [];
+async function loadRecords() {
+  const el = document.getElementById('view-records');
+  if (!agencyId) { renderEmpty(el, 'Select an agency'); return; }
+  renderLoading(el, 'Loading records\u2026');
+  try {
+    const [{ data: audits }, { data: sups }] = await Promise.all([
+      supabase.from('review_audits').select('*').eq('agency_id', agencyId).order('created_at', { ascending: false }),
+      supabase.from('profiles').select('id, full_name').eq('agency_id', agencyId),
+    ]);
+    const nameById = Object.fromEntries((sups || []).map((s) => [s.id, s.full_name]));
+    recordRows = (audits || []).map((a) => ({ ...a, supervisor_name: nameById[a.supervisor_id] || '—' }));
+    renderRecords(el);
+  } catch (e) { showError(e, 'Records'); renderErrorState(el); }
+}
+
+function renderRecords(el, query = '') {
+  const q = query.toLowerCase().trim();
+  const rows = recordRows.filter((r) => {
+    if (!q) return true;
+    const snap = r.review_snapshot || {};
+    return [r.audit_number, r.supervisor_name, snap.atlas_case_number, snap.police_case_number,
+      snap.incident_type_name, r.status].join(' ').toLowerCase().includes(q);
+  });
+  const closed = recordRows.filter((r) => r.status === 'closed');
+  const avgConc = closed.length
+    ? Math.round(closed.reduce((s, r) => s + Number(r.concurrence_pct || 0), 0) / closed.length) : null;
+
+  const html = [];
+  html.push(`<div class="notice notice-warning no-print" style="margin:0 0 16px;background:var(--accent-dim);color:var(--accent);border-color:var(--accent);">
+    <strong>Permanent record.</strong> Every selection receipt, audit, finding, acknowledgment, and disposition is retained indefinitely and is searchable. Closed records are read-only — enforced by the database for every role.</div>`);
+  html.push(`<div class="filter-bar no-print"><div style="flex:1;min-width:260px;">
+    <label class="field-label">Search records</label>
+    <input type="text" id="rec-search" value="${escAttr(query)}" placeholder="Audit ID, ATLAS case #, supervisor, incident type, status\u2026"></div></div>`);
+  html.push(`<div class="stat-grid">
+    <div class="stat"><div class="stat-value">${recordRows.length}</div><div class="stat-label">Audits on record</div></div>
+    <div class="stat"><div class="stat-value">${closed.length}</div><div class="stat-label">Closed</div></div>
+    <div class="stat"><div class="stat-value">${avgConc === null ? '—' : avgConc + '%'}</div><div class="stat-label">Avg concurrence (closed)</div></div>
+    <div class="stat"><div class="stat-value">${closed.filter((r) => r.outcome_match === false).length}</div><div class="stat-label">Outcome mismatches</div></div>
+  </div>`);
+  html.push(`<div class="card"><h2 class="card-title mt-0">Audit Records</h2>`);
+  if (!rows.length) {
+    html.push(`<p class="card-sub">No records${q ? ` match \u201c${escHtml(q)}\u201d` : ' yet'}.</p>`);
+  } else {
+    html.push(`<div class="table-wrap"><table class="data"><thead><tr>
+      <th>Audit</th><th>Review</th><th>Supervisor</th><th>Concurrence</th><th>Status</th><th>Closed</th></tr></thead><tbody>`);
+    rows.forEach((r) => {
+      const snap = r.review_snapshot || {};
+      html.push(`<tr class="rowlink" data-open="${escAttr(r.id)}">
+        <td><strong>${escHtml(r.audit_number)}</strong></td>
+        <td>${escHtml(snap.atlas_case_number || '—')} <span class="queue-meta">${escHtml(snap.incident_type_name || '')}</span></td>
+        <td>${escHtml(r.supervisor_name)}</td>
+        <td>${r.concurrence_pct === null || r.concurrence_pct === undefined ? '<span class="score-none">—</span>' : `<span class="${scoreClass(r.concurrence_pct)}">${escHtml(r.concurrence_pct)}%</span>`}</td>
+        <td>${statusPill(r.status)}</td>
+        <td>${escHtml(r.closed_at ? fmtDate(r.closed_at) : '—')}</td></tr>`);
+    });
+    html.push('</tbody></table></div>');
+  }
+  html.push('</div>');
+  el.innerHTML = html.join('');
+  const s = document.getElementById('rec-search');
+  if (s) { s.addEventListener('input', () => renderRecords(el, s.value)); s.focus(); if (q) s.setSelectionRange(q.length, q.length); }
+  el.querySelectorAll('tr[data-open]').forEach((tr) =>
+    tr.addEventListener('click', () => openWorkspace(tr.dataset.open)));
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+await Promise.all([loadMeasures(), loadContentText()]);
+if (currentAuditId) openWorkspace(currentAuditId); else loadQueue();
+</script>
+</body>
+</html>

@@ -22,6 +22,8 @@ const ICONS = {
   'agency-settings': '<svg viewBox="0 0 24 24"><path d="M3 21V8l9-5 9 5v13h-7v-6h-4v6H3zm2-2h2v-6h10v6h2V9.2l-7-3.9-7 3.9V19z"/></svg>',
   tickets: '<svg viewBox="0 0 24 24"><path d="M4 4h16a2 2 0 012 2v3a2 2 0 000 6v3a2 2 0 01-2 2H4a2 2 0 01-2-2v-3a2 2 0 000-6V6a2 2 0 012-2zm9 3h2v2h-2V7zm0 4h2v2h-2v-2zm0 4h2v2h-2v-2z"/></svg>',
   content: '<svg viewBox="0 0 24 24"><path d="M4 5h16v2H4zm0 4h16v2H4zm0 4h10v2H4zm12 1l1.4 2.9L20 17l-2 2 .5 3-2.5-1.4L13.5 22l.5-3-2-2 2.6-.1z"/></svg>',
+  audits: '<svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.4 9.4-8 10-4.6-.6-8-5-8-10V6l8-4zm-1.2 13.6l5.6-5.6-1.4-1.4-4.2 4.2-1.8-1.8-1.4 1.4 3.2 3.2z"/></svg>',
+  'my-findings': '<svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6zm4 18H6V4h7v5h5v11zM8 12h8v2H8v-2zm0 4h8v2H8v-2z"/></svg>',
 };
 
 // Grouped sections; each item points at a page key from ROLE_PERMISSIONS.
@@ -34,6 +36,7 @@ const NAV_SECTIONS = [
     { key: 'review-new', label: 'New Review', href: 'review-new.html' },
     { key: 'auto-select', label: 'Auto Select', href: 'auto-select.html' },
     { key: 'in-person-reviews', label: 'In-Person Reviews', href: 'in-person-reviews.html' },
+    { key: 'my-findings', label: 'My Audit Findings', href: 'my-findings.html' }, // Review Audit program (2026-08-01)
   ]},
   { label: 'Operations', items: [
     { key: 'delta-t', label: 'Delta T', href: 'delta-t.html' },
@@ -45,6 +48,7 @@ const NAV_SECTIONS = [
     { key: 'pips', label: 'PIPs', href: 'pips.html' },
   ]},
   { label: 'Administration', items: [
+    { key: 'audits', label: 'Review Audits', href: 'audits.html' }, // Review Audit program (2026-08-01)
     { key: 'admin', label: 'Admin Panel', href: 'admin.html' },
     { key: 'agency-settings', label: 'Agency Settings', href: 'agency-settings.html' },
     { key: 'tickets', label: 'Trouble Tickets', href: 'tickets.html' },

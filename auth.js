@@ -36,6 +36,8 @@ export const ROLE_PERMISSIONS = {
   'agency-settings':   ['super_admin', 'agency_admin'],
   tickets:             ['super_admin', 'agency_admin'],
   content:             ['super_admin', 'agency_admin'],
+  audits:              ['super_admin', 'chief', 'agency_admin'],  // Review Audit program — admin conducts, chief reads, super_admin oversight (2026-08-01)
+  'my-findings':       ['supervisor'],                            // supervisor's issued audit findings — acknowledge + single response (2026-08-01)
 };
 
 export function can(role, pageKey) {

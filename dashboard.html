@@ -239,6 +239,18 @@
       (iaRows || []).forEach((r) => { iaCounts[r.officer_id] = (iaCounts[r.officer_id] || 0) + 1; });
       const multiIA = (officers || []).filter((o) => (iaCounts[o.id] || 0) >= 2);
 
+      // Review Audit oversight (2026-08-01): cycle completion + concurrence health
+      const { data: cyc } = await supabase.from('audit_cycles').select('*')
+        .eq('agency_id', agencyId).order('created_at', { ascending: false }).limit(1);
+      const cycle = (cyc || [])[0] || null;
+      const { data: allAudits } = await supabase.from('review_audits')
+        .select('status, concurrence_pct, outcome_match, cycle_id').eq('agency_id', agencyId);
+      const cycleAudits = cycle ? (allAudits || []).filter((a) => a.cycle_id === cycle.id) : [];
+      const closedAudits = (allAudits || []).filter((a) => a.status === 'closed');
+      const avgConc = closedAudits.length
+        ? Math.round(closedAudits.reduce((s, a) => s + Number(a.concurrence_pct || 0), 0) / closedAudits.length) : null;
+      const mismatches = closedAudits.filter((a) => a.outcome_match === false).length;
+
       const officerLine = (o) => `
         <div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border);">
           <a href="officer-profile.html?id=${escAttr(o.id)}">${escHtml(o.last_name)}, ${escHtml(o.first_name)} <span class="text-muted">#${escHtml(o.badge_number || '')}</span></a>
@@ -262,6 +274,17 @@
             <a href="officer-profile.html?id=${escAttr(o.id)}">${escHtml(o.last_name)}, ${escHtml(o.first_name)}</a>
             <span class="pill pill-danger">${iaCounts[o.id]} referrals</span>
           </div>`).join('')}</div>` : ''}
+        <div class="card" style="border-left:4px solid var(--accent);">
+          <div class="flex-between">
+            <div>
+              <h2 class="card-title mb-0">Review Audit Oversight</h2>
+              <p class="card-sub" style="margin:4px 0 0;">${cycle
+                ? `${escHtml(cycle.cycle_label)}: ${cycleAudits.filter((a) => a.status === 'closed').length}/${cycleAudits.length} audits closed · due ${fmtDate(cycle.due_on)}${avgConc !== null ? ` · avg concurrence ${avgConc}%` : ''}${mismatches ? ` · ${mismatches} outcome mismatch(es) on record` : ''}`
+                : 'No audit cycle has been opened yet — supervisor coding is currently unverified.'}</p>
+            </div>
+            <a class="btn btn-secondary" href="audits.html">Review Audits</a>
+          </div>
+        </div>
         <div class="card">
           <div class="flex-between"><h2 class="card-title mb-0">Recent reviews</h2><a href="reviews.html">All reviews →</a></div>
           <div style="margin-top:10px;">
@@ -373,12 +396,35 @@
         count('access_requests', (q) => q.eq('agency_id', agencyId).eq('status', 'pending')),
         count('profiles', (q) => q.eq('agency_id', agencyId)),
       ]);
+
+      // Review Audit program — current cycle status (2026-08-01)
+      const { data: cyc } = await supabase.from('audit_cycles').select('*')
+        .eq('agency_id', agencyId).order('created_at', { ascending: false }).limit(1);
+      const cycle = (cyc || [])[0] || null;
+      let auditsTotal = 0, auditsOpen = 0, ackPending = 0;
+      if (cycle) {
+        auditsTotal = await count('review_audits', (q) => q.eq('cycle_id', cycle.id));
+        auditsOpen = await count('review_audits', (q) => q.eq('cycle_id', cycle.id).neq('status', 'closed'));
+        ackPending = await count('audit_findings', (q) => q.eq('agency_id', agencyId).eq('status', 'issued'));
+      }
+
       content.innerHTML = `
         <div class="stat-grid">
           ${stat('Roster officers', officers)}
           ${stat('Active officers', activeOfficers, 'success')}
           ${stat('App users', users)}
           ${stat('Pending access requests', pending, pending ? 'warning' : 'success')}
+        </div>
+        <div class="card" style="border-left:4px solid var(--accent);">
+          <div class="flex-between">
+            <div>
+              <h2 class="card-title mb-0">Review Audit Program</h2>
+              <p class="card-sub" style="margin:4px 0 0;">${cycle
+                ? `${escHtml(cycle.cycle_label)} — ${auditsTotal - auditsOpen}/${auditsTotal} audits closed · due ${fmtDate(cycle.due_on)}${ackPending ? ` · ${ackPending} finding(s) awaiting supervisor acknowledgment` : ''}`
+                : 'No cycle open. Opening a cycle runs the census selection — every eligible supervisor, permanent receipts written before any scoring.'}</p>
+            </div>
+            <a class="btn btn-primary" href="audits.html">${cycle && cycle.status === 'open' ? 'Work the audit queue' : 'Review Audits'}</a>
+          </div>
         </div>
         <div class="card">
           <h2 class="card-title">Agency setup checklist</h2>
@@ -396,6 +442,7 @@
             <a class="btn btn-secondary" href="admin.html">Users &amp; access requests</a>
             <a class="btn btn-secondary" href="content-manager.html">Content Manager</a>
             <a class="btn btn-secondary" href="agency-settings.html">Agency settings</a>
+            <a class="btn btn-secondary" href="audits.html">Review audits</a>
             <a class="btn btn-secondary" href="tickets.html">Trouble tickets</a>
           </div>
         </div>`;
@@ -426,6 +473,10 @@
       const reviewedIds = new Set((recent30 || []).map((r) => r.primary_officer_id));
       const due = active.filter((o) => !reviewedIds.has(o.id));
 
+      // Audit findings awaiting my acknowledgment (2026-08-01)
+      const pendingFindings = await count('audit_findings',
+        (q) => q.eq('supervisor_id', profile.id).eq('status', 'issued'));
+
       content.innerHTML = `
         <div class="stat-grid">
           ${stat('My roster', officers.length)}
@@ -433,6 +484,15 @@
           ${stat('Reviews due (30-day)', due.length, due.length ? 'warning' : 'success')}
           ${stat('Open Delta T (my officers)', (myDts || []).length, (myDts || []).length ? 'warning' : 'success')}
         </div>
+        ${pendingFindings ? `<div class="card" style="border-left:4px solid var(--warning);">
+          <div class="flex-between">
+            <div>
+              <h2 class="card-title mb-0">Audit findings awaiting acknowledgment</h2>
+              <p class="card-sub" style="margin:4px 0 0;">${pendingFindings} finding(s) from the Review Audit program require your timestamped acknowledgment. Acknowledgment confirms receipt of the instruction — not agreement with the finding.</p>
+            </div>
+            <a class="btn btn-primary" href="my-findings.html">Review &amp; acknowledge</a>
+          </div>
+        </div>` : ''}
         <div class="card" style="border-left:4px solid var(--accent);">
           <div class="flex-between">
             <div>

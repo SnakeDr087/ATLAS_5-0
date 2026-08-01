@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>My Audit Findings · ATLAS</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="atlas-logo.png" />
+  <style>
+    .find-box { border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
+      margin-bottom: 14px; background: var(--bg-elevated); }
+    .find-box.f-issued { border-left: 4px solid var(--warning); }
+    .find-box.f-acknowledged { border-left: 4px solid var(--accent); }
+    .find-box.f-closed { border-left: 4px solid var(--success); }
+    .find-tmpl { background: #f8fafc; border: 1px solid var(--border); border-radius: 8px;
+      padding: 12px 14px; font-size: 13.5px; line-height: 1.7; margin: 10px 0; }
+    .find-tmpl b { background: #fff3cd; padding: 0 3px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+<div class="app">
+  <aside id="sidebar"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main class="content">
+      <div id="page"></div>
+    </main>
+  </div>
+</div>
+
+<script type="module">
+import { bootPage } from './auth.js';
+import { supabase } from './supabase-client.js';
+import {
+  escHtml, escAttr, toast, showError, renderLoading, renderEmpty, renderErrorState,
+  fmtDate, fmtDateTime, outcomeLabel,
+} from './error-handler.js';
+import { mountAuditGenie } from './audit-genie.js';
+
+const { profile } = await bootPage('my-findings', 'My Audit Findings');
+mountAuditGenie('findings');
+
+const MARK_LABEL = { observed: 'Observed', not_observed: 'Not Observed', na: 'N/A',
+  identified: 'Identified', not_identified: 'Not identified' };
+const DISPO_LABEL = { sustained: 'Sustained', supervisor_favor: 'Resolved in supervisor\u2019s favor', de_minimis: 'Variance de minimis' };
+
+let kpiTextById = {}, safetyTextById = {}, measureByCode = {};
+let rows = [];
+
+async function loadRefs() {
+  const [{ data: kpis }, { data: safety }, { data: cms }] = await Promise.all([
+    supabase.from('kpi_definitions').select('id, kpi_text'),
+    supabase.from('safety_checklist_items').select('id, item_text'),
+    supabase.from('corrective_measures').select('code, label').eq('is_active', true),
+  ]);
+  (kpis || []).forEach((k) => { kpiTextById[k.id] = k.kpi_text; });
+  (safety || []).forEach((s) => { safetyTextById[s.id] = s.item_text; });
+  (cms || []).forEach((m) => { measureByCode[m.code] = m.label; });
+}
+const kpiText = (id) => kpiTextById[id] || (id === 'universal_assessment' ? 'Universal Performance Assessment' : id || '');
+const safetyText = (id) => safetyTextById[id] || id || '';
+const measureLabel = (c) => measureByCode[c] || c;
+
+function findingText(f) {
+  const typeName = escHtml(f.incident_type_name || 'unspecified');
+  const ts = `<b>${escHtml(f.footage_ts_from || '00:00:00')} \u2013 ${escHtml(f.footage_ts_to || '00:00:00')}</b>`;
+  if (f.finding_type === 'outcome') {
+    return `Outcome discrepancy noted on review <b>${escHtml(f.atlas_case_number || '')}</b> (incident type <b>${typeName}</b>). The auditor\u2019s independent assessment selected <b>${escHtml(outcomeLabel(f.auditor_value))}</b>; you selected <b>${escHtml(outcomeLabel(f.supervisor_value))}</b>. Supporting footage: ${ts}.`;
+  }
+  if (f.finding_type === 'safety') {
+    return `Officer-safety discrepancy noted: <b>${escHtml(safetyText(f.safety_item_id))}</b>, related to incident type <b>${typeName}</b> on review <b>${escHtml(f.atlas_case_number || '')}</b>. In the auditor\u2019s observations this deficiency was <b>${escHtml(MARK_LABEL[f.auditor_value] || f.auditor_value)}</b>; you recorded it as <b>${escHtml(MARK_LABEL[f.supervisor_value] || f.supervisor_value)}</b>. The evidence cited is located at ${ts}.`;
+  }
+  return `The following discrepancy was noted: <b>${escHtml(kpiText(f.kpi_id))}</b>, related to incident type <b>${typeName}</b> on review <b>${escHtml(f.atlas_case_number || '')}</b>. In the auditor\u2019s observations they saw <b>${escHtml(MARK_LABEL[f.auditor_value] || f.auditor_value)}</b>; you coded it as <b>${escHtml(MARK_LABEL[f.supervisor_value] || f.supervisor_value)}</b>. The evidence cited is located at ${ts}.`;
+}
+
+async function load() {
+  const el = document.getElementById('page');
+  renderLoading(el, 'Loading your audit findings\u2026');
+  try {
+    const { data, error } = await supabase.rpc('get_my_findings');
+    if (error) throw error;
+    rows = data || [];
+    render(el);
+  } catch (e) { showError(e, 'Findings'); renderErrorState(el); }
+}
+
+function render(el) {
+  if (!rows.length) {
+    renderEmpty(el, 'No audit findings',
+      'When a review you authored is audited and a finding is issued to you, it appears here for acknowledgment.');
+    return;
+  }
+  const pending = rows.filter((f) => f.status === 'issued');
+  const html = [];
+  if (pending.length) {
+    html.push(`<div class="notice notice-warning" style="margin:0 0 18px;">
+      <strong>${pending.length} finding(s) require acknowledgment.</strong>
+      Acknowledgment confirms receipt of the instruction — it is not a concession of the finding.
+      You may attach one written response per finding; it becomes part of the permanent record.</div>`);
+  }
+  html.push(`<div class="stat-grid">
+    <div class="stat ${pending.length ? 'warning' : 'success'}"><div class="stat-value">${pending.length}</div><div class="stat-label">Awaiting acknowledgment</div></div>
+    <div class="stat"><div class="stat-value">${rows.filter((f) => f.status === 'acknowledged').length}</div><div class="stat-label">Acknowledged</div></div>
+    <div class="stat"><div class="stat-value">${rows.filter((f) => f.status === 'closed').length}</div><div class="stat-label">Closed</div></div>
+  </div>`);
+
+  rows.forEach((f) => {
+    const typePill = f.finding_type === 'outcome' ? 'pill pill-warning' : f.finding_type === 'safety' ? 'pill pill-danger' : 'pill pill-accent';
+    const typeLbl = f.finding_type === 'outcome' ? 'Outcome discrepancy' : f.finding_type === 'safety' ? 'Safety discrepancy' : 'KPI discrepancy';
+    html.push(`<div class="find-box f-${escAttr(f.status)}">
+      <div class="flex-between">
+        <div><strong>${escHtml(f.audit_number)} · ${escHtml(f.finding_number)}</strong> <span class="${typePill}">${typeLbl}</span></div>
+        <span class="pill">${escHtml(f.status)}</span>
+      </div>
+      <div class="find-tmpl">${findingText(f)}</div>
+      <label class="field-label">Corrective measures directed</label>
+      ${(f.corrective_measures || []).length
+        ? '<ul style="margin:4px 0 10px 18px;font-size:13.5px;">' + f.corrective_measures.map((c) => `<li>${escHtml(measureLabel(c))}</li>`).join('') + '</ul>'
+        : '<p class="text-muted" style="margin:2px 0 10px;">None</p>'}
+      ${f.auditor_comment ? `<label class="field-label">Auditor comment</label><p style="margin:2px 0 10px;font-size:13.5px;">${escHtml(f.auditor_comment)}</p>` : ''}
+      ${f.status === 'issued' ? `
+        <div class="form-row">
+          <label class="field-label" for="resp-${escAttr(f.id)}">Your response (optional — one per finding, on the permanent record)</label>
+          <textarea id="resp-${escAttr(f.id)}" placeholder="Optional statement for the record\u2026"></textarea>
+        </div>
+        <button class="btn btn-primary" data-ack="${escAttr(f.id)}">Acknowledge Receipt (timestamped)</button>
+        <span class="text-muted" style="font-size:12.5px;margin-left:8px;">Issued ${escHtml(fmtDateTime(f.issued_at))}</span>`
+      : `
+        <label class="field-label">Acknowledged</label>
+        <p style="margin:2px 0 6px;font-size:13.5px;">${escHtml(fmtDateTime(f.acknowledged_at))}${f.supervisor_response ? '' : ' <span class="text-muted">(no response attached)</span>'}</p>
+        ${f.supervisor_response ? `<div class="find-tmpl" style="margin-top:4px;"><em>Your response:</em> ${escHtml(f.supervisor_response)}</div>` : ''}
+        ${f.disposition ? `<label class="field-label">Disposition</label><span class="${f.disposition === 'sustained' ? 'pill pill-warning' : 'pill pill-success'}">${escHtml(DISPO_LABEL[f.disposition] || f.disposition)}</span>` : ''}`}
+    </div>`);
+  });
+  el.innerHTML = html.join('');
+
+  el.querySelectorAll('[data-ack]').forEach((btn) => btn.addEventListener('click', async () => {
+    const id = btn.dataset.ack;
+    const resp = (document.getElementById('resp-' + id)?.value || '').trim();
+    const msg = resp
+      ? 'Acknowledge receipt of this finding with your response attached?\n\nBoth are timestamped and permanent — they cannot be edited afterward.'
+      : 'Acknowledge receipt of this finding?\n\nThe acknowledgment is timestamped and permanent. Acknowledging confirms receipt of the instruction, not agreement with the finding.';
+    if (!confirm(msg)) return;
+    btn.disabled = true;
+    try {
+      const { data, error } = await supabase.rpc('acknowledge_finding', {
+        p_finding_id: id, p_response: resp || null,
+      });
+      if (error) throw error;
+      toast(`${data.finding} acknowledged${resp ? ' — response on the record' : ''}.`);
+      load();
+    } catch (e) { btn.disabled = false; showError(e, 'Acknowledge'); }
+  }));
+}
+
+await loadRefs();
+load();
+</script>
+</body>
+</html>
