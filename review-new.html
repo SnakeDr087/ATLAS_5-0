@@ -90,6 +90,7 @@
             <div><label class="field-label">Recording end</label><input type="time" id="f-rec-end" /></div>
             <div><label class="field-label">Agency</label><input type="text" readonly value="${escAttr(profile.agency?.name || '')}" /></div>
           </div>
+          <div id="date-warning" hidden></div>
         </div>
 
         <!-- 2 · INCIDENT LOCATION -->
@@ -209,6 +210,12 @@
 
       document.getElementById('f-review-date').value = new Date().toISOString().slice(0, 10);
 
+      // Date-order guard — mirrors the DB constraint bwc_reviews_review_after_incident.
+      // A review cannot be authored before the incident it reviews. Caught here so the
+      // reviewer sees a readable message instead of a database error on submit.
+      ['f-review-date', 'f-incident-date'].forEach((id) =>
+        document.getElementById(id).addEventListener('change', validateDates));
+
       // Officer components — THE shared OfficerSearch, scoped by role.
       const scope = profile.role === 'supervisor' ? { supervisorId: profile.id } : {};
       primaryOS = new OfficerSearch(document.getElementById('primary-officer'), { agencyId, ...scope });
@@ -289,6 +296,39 @@
       }
     }
 
+    // Returns true when the dates are usable. Paints an inline warning and
+    // marks the offending field when the incident post-dates the review.
+    // Mirrors the DB constraint so the form never round-trips a doomed insert.
+    function validateDates() {
+      const reviewEl = document.getElementById('f-review-date');
+      const incidentEl = document.getElementById('f-incident-date');
+      const box = document.getElementById('date-warning');
+      if (!reviewEl || !incidentEl || !box) return true;
+
+      const reviewDate = reviewEl.value;
+      const incidentDate = incidentEl.value;
+
+      // Constrain the native pickers so the bad combination is hard to reach.
+      reviewEl.min = incidentDate || '';
+      incidentEl.max = reviewDate || '';
+
+      const bad = reviewDate && incidentDate && incidentDate > reviewDate;
+      incidentEl.style.borderColor = bad ? 'var(--danger)' : '';
+      reviewEl.style.borderColor = bad ? 'var(--danger)' : '';
+
+      if (bad) {
+        box.hidden = false;
+        box.innerHTML = `<div class="notice notice-danger" style="margin-top:12px;">
+          <strong>Check these dates.</strong> The incident date is after the review date —
+          a review can't be recorded before the incident it reviews. Correct one of the two to continue.
+        </div>`;
+        return false;
+      }
+      box.hidden = true;
+      box.innerHTML = '';
+      return true;
+    }
+
     async function loadKpis() {
       const typeId = document.getElementById('f-incident-type').value;
       const block = document.getElementById('kpi-block');
@@ -363,6 +403,11 @@
       const typeId = document.getElementById('f-incident-type').value;
       const reportNotes = document.getElementById('f-report-notes').value.trim();
 
+      if (!validateDates()) {
+        document.getElementById('f-incident-date').focus();
+        document.getElementById('sec-details').scrollIntoView({ behavior: 'smooth', block: 'center' });
+        return toast('The incident date is after the review date — correct the dates before submitting.', 'error');
+      }
       if (!officer) return toast('Select a primary officer.', 'error');
       if (!typeId) return toast('Select an incident type.', 'error');
       const unanswered = kpisForType.filter((k) => !kpiState[k.id]);
